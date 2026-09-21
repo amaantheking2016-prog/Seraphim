@@ -1,0 +1,1122 @@
+print("[Seraphim] 1. script start")
+
+-- ============================================================
+-- BAC BYPASS
+-- ============================================================
+pcall(function()
+    if getgenv()._SeraphimBAC then return end
+    getgenv()._SeraphimBAC = true
+    local ContentProvider = game:GetService("ContentProvider")
+    local hook = hookfunction or detour_function
+    local cclosure = newcclosure or function(f) return f end
+    local renv = getrenv and getrenv() or _G
+    if not hook then return end
+    local function isRelevantCaller()
+        for i = 3, 6 do
+            local src = debug.info(i, "s")
+            if src and (src:find("RemoveLoadingScreen") or src:find("Loading") or src:find("Detection")) then
+                return true
+            end
+        end
+        return false
+    end
+    local originalRandom
+    originalRandom = hook(renv.math.random, cclosure(function(...)
+        if isRelevantCaller() then return 0 end
+        return originalRandom(...)
+    end))
+    local originalPreloadAsync
+    originalPreloadAsync = hook(ContentProvider.PreloadAsync, cclosure(function(self, assets, callback)
+        if self ~= ContentProvider then return originalPreloadAsync(self, assets, callback) end
+        if isRelevantCaller() and type(assets) == "table" then
+            if callback then
+                for _, asset in ipairs(assets) do
+                    task.spawn(pcall, callback, asset, Enum.AssetFetchStatus.Success)
+                end
+            end
+            return
+        end
+        return originalPreloadAsync(self, assets, callback)
+    end))
+    print("[Seraphim] 2. BAC on")
+end)
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+print("[Seraphim] 3. game loaded")
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+local Stats             = game:GetService("Stats")
+local CoreGui           = game:GetService("CoreGui")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local TweenService      = game:GetService("TweenService")
+local LocalPlayer       = Players.LocalPlayer
+
+local function getExecutorGlobal(name)
+    if getgenv and getgenv()[name] ~= nil then return getgenv()[name] end
+    if _G and _G[name] ~= nil then return _G[name] end
+    if shared and shared[name] ~= nil then return shared[name] end
+    if getrenv and getrenv()[name] ~= nil then return getrenv()[name] end
+    local value = nil
+    pcall(function()
+        if gethui then
+            local hui = gethui()
+            if hui and hui[name] ~= nil then value = hui[name] end
+        end
+    end)
+    if value ~= nil then return value end
+    pcall(function()
+        if getfenv then
+            local environment = getfenv(0)
+            if environment and environment[name] ~= nil then value = environment[name] end
+        end
+    end)
+    if value ~= nil then return value end
+    return nil
+end
+
+-- ============================================================
+-- PARRY PATCH + INSTA FIND
+-- ============================================================
+local _PARRY_PATCH = {
+    keyTable = nil, transformFn = nil, parryHash = nil,
+    parryRemote = nil, ready = false,
+}
+
+task.spawn(function()
+    local RS = game:GetService("ReplicatedStorage")
+    local Controllers = RS:WaitForChild("Controllers", 30)
+    if not Controllers then warn("[Seraphim] Controllers not found") return end
+    local SC
+    for _, child in ipairs(Controllers:GetChildren()) do
+        if child.Name:sub(1, 16) == "SwordsController" then SC = child; break end
+    end
+    if not SC then warn("[Seraphim] SwordsController not found") return end
+    local PRY = SC:WaitForChild("PRY", 30)
+    if not PRY then warn("[Seraphim] PRY not found") return end
+    local getupvals = debug.getupvalues or getupvalues
+    if not getupvals then warn("[Seraphim] no getupvalues") return end
+    local Parry_Function = require(PRY)
+    if type(Parry_Function) ~= "function" then warn("[Seraphim] PRY not a function") return end
+    local ups = getupvals(Parry_Function)
+    if not ups or #ups < 8 then warn("[Seraphim] PRY upvalues too few") return end
+    _PARRY_PATCH.keyTable    = ups[3]
+    _PARRY_PATCH.transformFn = ups[4]
+    _PARRY_PATCH.parryHash   = ups[8]
+    print("[Seraphim] 4. PRY harvested")
+    for i, up in ipairs(ups) do
+        if typeof(up) == "Instance" and (up:IsA("RemoteEvent") or up:IsA("RemoteFunction")) then
+            _PARRY_PATCH.parryRemote = up
+            _PARRY_PATCH.ready = true
+            print("[Seraphim] INSTA: remote in PRY up[" .. i .. "]:", up.Name)
+            break
+        end
+    end
+    if not _PARRY_PATCH.ready then
+        local ok, scTable = pcall(require, SC)
+        if ok and type(scTable) == "table" then
+            for k, v in pairs(scTable) do
+                if typeof(v) == "Instance" and (v:IsA("RemoteEvent") or v:IsA("RemoteFunction")) then
+                    _PARRY_PATCH.parryRemote = v
+                    _PARRY_PATCH.ready = true
+                    print("[Seraphim] INSTA: remote in SC." .. tostring(k) .. ":", v.Name)
+                    break
+                end
+                if type(v) == "function" and not _PARRY_PATCH.ready then
+                    local ok2, funcUps = pcall(getupvals, v)
+                    if ok2 and type(funcUps) == "table" then
+                        for j, up in ipairs(funcUps) do
+                            if typeof(up) == "Instance" and (up:IsA("RemoteEvent") or up:IsA("RemoteFunction")) then
+                                _PARRY_PATCH.parryRemote = up
+                                _PARRY_PATCH.ready = true
+                                print("[Seraphim] INSTA: remote in SC." .. tostring(k) .. " up[" .. j .. "]:", up.Name)
+                                break
+                            end
+                        end
+                    end
+                end
+                if _PARRY_PATCH.ready then break end
+            end
+        end
+    end
+    if not _PARRY_PATCH.ready then
+        local Remotes = RS:FindFirstChild("Remotes")
+        if Remotes then
+            local blocklist = {success=true, fail=true, visual=true, sound=true, fx=true, effect=true, feedback=true, ui=true, notify=true, broadcast=true}
+            for _, r in ipairs(Remotes:GetChildren()) do
+                if r:IsA("RemoteEvent") or r:IsA("RemoteFunction") then
+                    local name = r.Name:lower()
+                    local blocked = false
+                    for word in pairs(blocklist) do
+                        if name:find(word, 1, true) then blocked = true; break end
+                    end
+                    if not blocked and name:find("parry", 1, true) then
+                        _PARRY_PATCH.parryRemote = r
+                        _PARRY_PATCH.ready = true
+                        print("[Seraphim] INSTA: remote by name:", r.Name)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    if _PARRY_PATCH.ready then
+        print("[Seraphim] INSTA-ARMED:", _PARRY_PATCH.parryRemote.Name)
+    else
+        print("[Seraphim] INSTA failed - parry once to arm via hook")
+    end
+end)
+
+do
+    local _reverted = {}
+    local _hookedMetas = setmetatable({}, {__mode = "k"})
+    local function _is_valid(args)
+        return #args == 8 and type(args[2]) == "string" and type(args[3]) == "string"
+            and type(args[4]) == "number" and typeof(args[5]) == "CFrame"
+            and type(args[6]) == "table" and type(args[7]) == "table" and type(args[8]) == "boolean"
+    end
+    local function _hook(remote)
+        if _reverted[remote] then return end
+        local ok, meta = pcall(getrawmetatable, remote)
+        if not ok or not meta then return end
+        if _hookedMetas[meta] then _reverted[remote] = true; return end
+        _hookedMetas[meta] = true
+        _reverted[remote] = true
+        pcall(function()
+            setreadonly(meta, false)
+            local _old = meta.__index
+            meta.__index = function(self, key)
+                if (key == "FireServer" and self:IsA("RemoteEvent"))
+                    or (key == "InvokeServer" and self:IsA("RemoteFunction")) then
+                    return function(_, ...)
+                        local _arguments = { ... }
+                        if _is_valid(_arguments) then
+                            if _PARRY_PATCH.keyTable and _PARRY_PATCH.transformFn then
+                                _PARRY_PATCH.parryRemote = self
+                                _PARRY_PATCH.parryHash   = _arguments[1]
+                                if not _PARRY_PATCH.ready then
+                                    _PARRY_PATCH.ready = true
+                                    print("[Seraphim] 5. remote armed via hook:", self.Name)
+                                end
+                            end
+                        end
+                        return _old(self, key)(_, unpack(_arguments))
+                    end
+                end
+                return _old(self, key)
+            end
+            setreadonly(meta, true)
+        end)
+    end
+    local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    if Remotes then
+        for _, remote in ipairs(Remotes:GetChildren()) do
+            if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") then
+                pcall(_hook, remote)
+            end
+        end
+    end
+end
+
+function _PARRY_PATCH.fire(curveCFrame, screenPositions, mouseLocation)
+    if not _PARRY_PATCH.ready or not _PARRY_PATCH.parryRemote then return false end
+    local kt = _PARRY_PATCH.keyTable
+    if not kt then return false end
+    local keyIndex = kt[1]
+    local currentKey = kt[2] and kt[2][keyIndex]
+    if not currentKey then
+        currentKey = kt[3]
+        if type(currentKey) ~= "string" and type(currentKey) ~= "number" then
+            if type(kt[1]) == "table" and kt[3] then currentKey = kt[1][kt[3]] end
+        end
+    end
+    if not currentKey then return false end
+    local tok, transformed = pcall(_PARRY_PATCH.transformFn, currentKey, "TIME")
+    if not tok or not transformed then
+        tok, transformed = pcall(_PARRY_PATCH.transformFn, currentKey)
+        if not tok or not transformed then return false end
+    end
+    local serverTime = workspace:GetServerTimeNow() * 100
+    local timeStr = tostring(math.floor(serverTime))
+    local tc = {}
+    for i = 1, #timeStr do
+        local ki = (i - 1) % #transformed + 1
+        local kb = string.byte(transformed, ki) or 0
+        local tb = (string.byte(timeStr, i) + i) % 256
+        tc[i] = string.char(bit32.bxor(tb, kb))
+    end
+    local token = table.concat(tc)
+    return pcall(function()
+        _PARRY_PATCH.parryRemote:FireServer(
+            _PARRY_PATCH.parryHash, currentKey, token, 0.5,
+            curveCFrame, screenPositions, mouseLocation, false
+        )
+    end)
+end
+
+-- ============================================================
+-- CONFIG / STATE
+-- ============================================================
+local Config = {
+    Enabled = false, RangeMult = 1.0, Accuracy = 100, MinCooldown = 0.55,
+    CurveMode = "Camera", AntiCurve = false, ManualSpam = false, SpamCPS = 20,
+}
+local State = { lastParry = 0, lockedUntil = 0, parried = false, conn = nil }
+
+local function flat(v)
+    local f = Vector3.new(v.X, 0, v.Z)
+    if f.Magnitude < 1e-4 then return Vector3.new(0, 0, -1) end
+    return f.Unit
+end
+local function bodyFlatLookRight()
+    local char = LocalPlayer.Character
+    local root = char and char.PrimaryPart
+    if root then return flat(root.CFrame.LookVector), flat(root.CFrame.RightVector), root.Position end
+    local cam = workspace.CurrentCamera
+    if not cam then return Vector3.new(0, 0, -1), Vector3.new(1, 0, 0), Vector3.zero end
+    return flat(cam.CFrame.LookVector), flat(cam.CFrame.RightVector), cam.CFrame.Position
+end
+local function curveCFrame()
+    local cam = workspace.CurrentCamera
+    if not cam then return CFrame.new() end
+    local bodyLook, bodyRight, origin = bodyFlatLookRight()
+    local mode = Config.CurveMode
+    if mode == "Random" then
+        local modes = { "Camera", "Left", "Right", "Back", "High", "Low" }
+        mode = modes[math.random(1, #modes)]
+    end
+    if mode == "Camera" then return cam.CFrame end
+    local aim
+    if mode == "Left" then aim = origin - bodyRight * 10000
+    elseif mode == "Right" then aim = origin + bodyRight * 10000
+    elseif mode == "Back" then aim = origin - bodyLook * 10000
+    elseif mode == "High" then aim = origin + Vector3.new(0, 12000, 0) + bodyLook * 200
+    elseif mode == "Low" then aim = origin + Vector3.new(0, -9000, 0) + bodyLook * 400
+    else return cam.CFrame end
+    return CFrame.new(origin, aim)
+end
+local function screenPositions()
+    local cam = workspace.CurrentCamera
+    local map = {}
+    local alive = workspace:FindFirstChild("Alive")
+    if not (alive and cam) then return map end
+    for _, e in pairs(alive:GetChildren()) do
+        if e.PrimaryPart then
+            local s, sp = pcall(cam.WorldToScreenPoint, cam, e.PrimaryPart.Position)
+            if s then map[e.Name] = sp end
+        end
+    end
+    return map
+end
+local function mouseLoc()
+    local m = UserInputService:GetMouseLocation()
+    return { m.X, m.Y }
+end
+local function fireParry()
+    return _PARRY_PATCH.fire(curveCFrame(), screenPositions(), mouseLoc())
+end
+local function getBalls()
+    local out = {}
+    local function collect(folder)
+        if not folder then return end
+        for _, b in pairs(folder:GetChildren()) do
+            if b:GetAttribute("realBall") or b:FindFirstChild("zoomies") then
+                out[#out + 1] = b
+            end
+        end
+    end
+    collect(workspace:FindFirstChild("Balls"))
+    collect(workspace:FindFirstChild("TrainingBalls"))
+    return out
+end
+local function getPrimaryBall()
+    local balls = workspace:FindFirstChild("Balls")
+    if balls then
+        for _, b in pairs(balls:GetChildren()) do
+            if b:GetAttribute("realBall") then return b end
+        end
+    end
+    return nil
+end
+local function isTargeted(ball)
+    local t = ball:GetAttribute("target")
+    return t == LocalPlayer.Name or t == LocalPlayer.DisplayName
+end
+local function getPing()
+    local ok, v = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return (ok and typeof(v) == "number") and v or 60
+end
+
+local curveState = { lerp_radians = 0, last_warping = 0, curving = 0 }
+local function linear_predict(a, b, t) return a + (b - a) * t end
+local function is_curved()
+    local ball = getPrimaryBall()
+    if not ball then return false end
+    if not LocalPlayer.Character or not LocalPlayer.Character.PrimaryPart then return false end
+    local zoomies = ball:FindFirstChild("zoomies")
+    if not zoomies then return false end
+    local velocity = zoomies.VectorVelocity or Vector3.new()
+    local speed = velocity.Magnitude
+    if speed == 0 then return false end
+    local ball_direction = velocity.Unit
+    local direction_vector = LocalPlayer.Character.PrimaryPart.Position - ball.Position
+    if direction_vector.Magnitude == 0 then return false end
+    local direction = direction_vector.Unit
+    local dot = direction:Dot(ball_direction)
+    local speed_threshold = math.min(speed / 100, 40)
+    local direction_difference = ball_direction - velocity
+    local direction_similarity = 0
+    if direction_difference.Magnitude > 0 then
+        direction_similarity = direction:Dot(direction_difference.Unit)
+    end
+    local dot_difference = dot - direction_similarity
+    local distance = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Magnitude
+    local ping = getPing()
+    local dot_threshold = 0.5 - (ping / 1000)
+    local reach_time = distance / speed - (ping / 1000)
+    local ball_distance_threshold = 15 - math.min(distance / 1000, 15) + speed_threshold
+    local clamped_dot = math.clamp(dot, -1, 1)
+    local radians = math.rad(math.asin(clamped_dot))
+    curveState.lerp_radians = linear_predict(curveState.lerp_radians, radians, 0.8)
+    if speed > 0 and reach_time > ping / 10 then
+        ball_distance_threshold = math.max(ball_distance_threshold - 15, 15)
+    end
+    if distance < ball_distance_threshold then return false end
+    if dot_difference < dot_threshold then return true end
+    if curveState.lerp_radians < 0.018 then curveState.last_warping = tick() end
+    if (tick() - curveState.last_warping) < (reach_time / 1.5) then return true end
+    if (tick() - curveState.curving) < (reach_time / 1.5) then return true end
+    return dot < dot_threshold
+end
+
+local function divisor_mult()
+    local acc = math.clamp(Config.Accuracy or 100, 1, 100)
+    return 0.7 + (acc - 1) * 0.0035353535353535
+end
+local function tryParry(ball)
+    local now = tick()
+    if State.parried or now < State.lockedUntil then return end
+    if (now - State.lastParry) < Config.MinCooldown then return end
+    if not Config.Enabled or not _PARRY_PATCH.ready then return end
+    if not LocalPlayer.Character or not LocalPlayer.Character.PrimaryPart then return end
+    local zoomies = ball:FindFirstChild("zoomies")
+    if not zoomies or not isTargeted(ball) then return end
+    if Config.AntiCurve and is_curved() then return end
+    local velocity = zoomies.VectorVelocity or Vector3.new()
+    local speed = velocity.Magnitude
+    if speed < 1 then return end
+    local distance = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Magnitude
+    local ping = getPing() / 10
+    local ping_threshold = math.clamp(ping / 10, 5, 17)
+    local capped = math.min(math.max(speed - 9.5, 0), 650)
+    local speed_divisor = (2.4 + capped * 0.002) * divisor_mult()
+    local parry_accuracy = (ping_threshold + math.max(speed / math.max(speed_divisor, 0.4), 9.5)) * Config.RangeMult
+    if distance > parry_accuracy then return end
+    State.parried = true
+    State.lastParry = now
+    State.lockedUntil = now + Config.MinCooldown
+    fireParry()
+    pcall(function()
+        ball:GetAttributeChangedSignal("target"):Once(function()
+            State.parried = false
+            State.lockedUntil = 0
+        end)
+    end)
+    task.delay(math.max(Config.MinCooldown, 0.6), function() State.parried = false end)
+end
+local function startAP()
+    if State.conn then State.conn:Disconnect() end
+    State.conn = RunService.Heartbeat:Connect(function()
+        if not Config.Enabled or not _PARRY_PATCH.ready then return end
+        if State.parried or tick() < State.lockedUntil then return end
+        for _, ball in ipairs(getBalls()) do
+            tryParry(ball)
+            if State.parried then break end
+        end
+    end)
+end
+local function stopAP()
+    if State.conn then State.conn:Disconnect() State.conn = nil end
+    State.parried = false
+    State.lockedUntil = 0
+    Config.Enabled = false
+end
+
+-- ============================================================
+-- SPAM BUTTON
+-- ============================================================
+local ManualSpam = { gui = nil, holding = false, conn = nil, ic = nil, ie = nil, button = nil, active = false, drag = false, moved = false, dragStart = nil, startPos = nil }
+local function stopManualSpamLoop()
+    ManualSpam.holding = false
+    if ManualSpam.conn then ManualSpam.conn:Disconnect(); ManualSpam.conn = nil end
+end
+local function startManualSpamLoop()
+    stopManualSpamLoop()
+    ManualSpam.holding = true
+    local acc = 0
+    ManualSpam.conn = RunService.Heartbeat:Connect(function(dt)
+        if not ManualSpam.holding or not Config.ManualSpam then stopManualSpamLoop(); return end
+        if not _PARRY_PATCH.ready then return end
+        local cps = math.clamp(Config.SpamCPS or 20, 20, 500)
+        acc = acc + (dt or 0.016)
+        if acc < (1 / cps) then return end
+        acc = 0
+        local now = tick()
+        if State.parried or now < State.lockedUntil then return end
+        if (now - State.lastParry) < 0.05 then return end
+        State.parried = true
+        State.lastParry = now
+        State.lockedUntil = now + 0.08
+        fireParry()
+        task.delay(0.08, function() State.parried = false end)
+    end)
+end
+local function destroySpamButton()
+    stopManualSpamLoop()
+    if ManualSpam.ic then ManualSpam.ic:Disconnect(); ManualSpam.ic = nil end
+    if ManualSpam.ie then ManualSpam.ie:Disconnect(); ManualSpam.ie = nil end
+    if ManualSpam.gui then ManualSpam.gui:Destroy(); ManualSpam.gui = nil end
+    ManualSpam.button = nil
+    ManualSpam.active = false
+end
+local function createSpamButton()
+    destroySpamButton()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SeraphimSpamButton"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = CoreGui
+    ManualSpam.gui = gui
+    local button = Instance.new("TextButton")
+    button.Size = UDim2.new(0, 140, 0, 50)
+    button.Position = UDim2.new(0.5, -70, 0.78, 0)
+    button.BackgroundTransparency = 1
+    button.AnchorPoint = Vector2.new(0.5, 0)
+    button.AutoButtonColor = false
+    button.Text = ""
+    button.Active = true
+    button.Parent = gui
+    ManualSpam.button = button
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+    bg.BorderSizePixel = 0
+    bg.Parent = button
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", bg)
+    stroke.Color = Color3.fromRGB(55, 120, 200)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.25
+    local text = Instance.new("TextLabel")
+    text.Size = UDim2.new(1, 0, 1, 0)
+    text.BackgroundTransparency = 1
+    text.Text = "Spam"
+    text.Font = Enum.Font.GothamBold
+    text.TextSize = 16
+    text.TextColor3 = Color3.fromRGB(230, 230, 240)
+    text.Parent = button
+    local function setVisual(on)
+        if on then
+            bg.BackgroundColor3 = Color3.fromRGB(35, 70, 120)
+            stroke.Color = Color3.fromRGB(80, 170, 255)
+            text.Text = "ON"
+            text.TextColor3 = Color3.fromRGB(120, 200, 255)
+        else
+            bg.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+            stroke.Color = Color3.fromRGB(55, 120, 200)
+            text.Text = "Spam"
+            text.TextColor3 = Color3.fromRGB(230, 230, 240)
+        end
+    end
+    local function toggle()
+        if not Config.ManualSpam then return end
+        if not ManualSpam.active then
+            if not _PARRY_PATCH.ready then return end
+            ManualSpam.active = true
+            setVisual(true)
+            startManualSpamLoop()
+        else
+            ManualSpam.active = false
+            setVisual(false)
+            stopManualSpamLoop()
+        end
+    end
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            ManualSpam.drag = true
+            ManualSpam.moved = false
+            ManualSpam.dragStart = input.Position
+            ManualSpam.startPos = button.Position
+        end
+    end)
+    ManualSpam.ic = UserInputService.InputChanged:Connect(function(input)
+        if not ManualSpam.drag then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local d = input.Position - ManualSpam.dragStart
+        if d.Magnitude > 8 then
+            ManualSpam.moved = true
+            button.Position = UDim2.new(
+                ManualSpam.startPos.X.Scale, ManualSpam.startPos.X.Offset + d.X,
+                ManualSpam.startPos.Y.Scale, ManualSpam.startPos.Y.Offset + d.Y)
+        end
+    end)
+    ManualSpam.ie = UserInputService.InputEnded:Connect(function(input)
+        if not ManualSpam.drag then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        ManualSpam.drag = false
+        if not ManualSpam.moved then toggle() end
+    end)
+end
+
+print("[Seraphim] 6. parry systems ready")
+
+-- ============================================================
+-- UNLOCK CODE (config + sword skin)
+-- ============================================================
+local SKIN_LAST_EQUIPPED_CONFIG_KEY = "Skin.LastEquippedSword"
+local EXPLOSION_LAST_EQUIPPED_CONFIG_KEY = "Skin.LastEquippedExplosion"
+local AUTO_CONFIG_FILE = "UnlockSuite/auto_config.json"
+
+local function readUnlockSuiteAutoConfig()
+    local data = {}
+    pcall(function()
+        if isfile and isfile(AUTO_CONFIG_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(AUTO_CONFIG_FILE))
+            if type(decoded) == "table" then data = decoded end
+        end
+    end)
+    return data
+end
+local function writeUnlockSuiteAutoConfig(data)
+    pcall(function()
+        if isfolder and makefolder and not isfolder("UnlockSuite") then makefolder("UnlockSuite") end
+        if writefile then writefile(AUTO_CONFIG_FILE, HttpService:JSONEncode(data or {})) end
+    end)
+end
+local function loadLastEquippedSword()
+    local data = readUnlockSuiteAutoConfig()
+    local saved = data[SKIN_LAST_EQUIPPED_CONFIG_KEY]
+    return type(saved) == "string" and saved or ""
+end
+local function loadLastEquippedExplosion()
+    local data = readUnlockSuiteAutoConfig()
+    local saved = data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY]
+    return type(saved) == "string" and saved or ""
+end
+getgenv().saveLastEquippedSword = function(swordName)
+    if type(swordName) ~= "string" or swordName == "" then return end
+    local autoConfig = getgenv()._usAutoConfig
+    local data = autoConfig and autoConfig.Data
+    if type(data) ~= "table" then data = readUnlockSuiteAutoConfig() end
+    data[SKIN_LAST_EQUIPPED_CONFIG_KEY] = swordName
+    if autoConfig and type(autoConfig.Data) == "table" then
+        autoConfig.Data[SKIN_LAST_EQUIPPED_CONFIG_KEY] = swordName
+    end
+    writeUnlockSuiteAutoConfig(data)
+end
+getgenv().saveLastEquippedExplosion = function(explosionName)
+    if type(explosionName) ~= "string" or explosionName == "" then return end
+    local autoConfig = getgenv()._usAutoConfig
+    local data = autoConfig and autoConfig.Data
+    if type(data) ~= "table" then data = readUnlockSuiteAutoConfig() end
+    data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY] = explosionName
+    if autoConfig and type(autoConfig.Data) == "table" then
+        autoConfig.Data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY] = explosionName
+    end
+    writeUnlockSuiteAutoConfig(data)
+end
+do
+    local savedLastSword = loadLastEquippedSword()
+    local savedLastExplosion = loadLastEquippedExplosion()
+    getgenv().skinChanger = getgenv().skinChanger or savedLastSword ~= ""
+    getgenv().swordModel = type(getgenv().swordModel) == "string" and getgenv().swordModel ~= "" and getgenv().swordModel or savedLastSword
+    getgenv().swordAnimations = type(getgenv().swordAnimations) == "string" and getgenv().swordAnimations ~= "" and getgenv().swordAnimations or savedLastSword
+    getgenv().swordFX = type(getgenv().swordFX) == "string" and getgenv().swordFX ~= "" and getgenv().swordFX or savedLastSword
+    getgenv().explosionChanger = getgenv().explosionChanger or savedLastExplosion ~= ""
+    getgenv().explosionFX = type(getgenv().explosionFX) == "string" and getgenv().explosionFX ~= "" and getgenv().explosionFX or savedLastExplosion
+end
+
+task.spawn(function()
+    local rs = game:GetService("ReplicatedStorage")
+    local swordInstancesInstance = rs:WaitForChild("Shared", 9e9):WaitForChild("ReplicatedInstances", 9e9):WaitForChild("Swords", 9e9)
+    local swordInstances = require(swordInstancesInstance)
+    local swordsController
+    task.spawn(function()
+        while task.wait(0.25) and not swordsController do
+            local ok, conns = pcall(getconnections, rs.Remotes.FireSwordInfo.OnClientEvent)
+            if ok and conns then
+                for _, v in ipairs(conns) do
+                    if v.Function and islclosure and islclosure(v.Function) then
+                        local ok2, up = pcall(getupvalues, v.Function)
+                        if ok2 and #up == 1 and type(up[1]) == "table" then
+                            swordsController = up[1]
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    local function getSlashName(swordName)
+        local ok, sln = pcall(function() return swordInstances:GetSword(swordName) end)
+        return (ok and sln and sln.SlashName) or "SlashEffect"
+    end
+    local function refreshSlashName()
+        local fxName = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
+        if fxName ~= "" then
+            getgenv().slashName = getSlashName(fxName)
+        else
+            getgenv().slashName = "SlashEffect"
+        end
+    end
+    refreshSlashName()
+    local function setSword()
+        if not getgenv().skinChanger then return end
+        if not LocalPlayer.Character then return end
+        pcall(function()
+            local f = rawget(swordInstances, "EquipSwordTo")
+            if type(f) == "function" then
+                local ups = getupvalues(f)
+                for i = 1, #ups do
+                    if type(ups[i]) == "boolean" then
+                        setupvalue(f, i, false)
+                        break
+                    end
+                end
+            end
+        end)
+        pcall(function()
+            swordInstances:EquipSwordTo(LocalPlayer.Character, getgenv().swordModel)
+        end)
+        task.spawn(function()
+            local attempts = 0
+            while not swordsController and attempts < 20 do
+                task.wait(0.5); attempts = attempts + 1
+            end
+            if not swordsController then return end
+            pcall(function()
+                if swordsController.SetSword then
+                    swordsController:SetSword(getgenv().swordAnimations ~= "" and getgenv().swordAnimations or getgenv().swordModel)
+                end
+            end)
+            pcall(function()
+                local targetSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
+                if rs.Remotes:FindFirstChild("FireSwordInfo") then
+                    rs.Remotes.FireSwordInfo:FireServer(targetSword)
+                end
+                if swordsController.currentSword ~= nil then
+                    pcall(function() swordsController.currentSword = targetSword end)
+                end
+                if swordsController.SwordFX ~= nil then
+                    pcall(function() swordsController.SwordFX = targetSword end)
+                end
+            end)
+        end)
+    end
+    local hookedFuncs = {}
+    task.spawn(function()
+        local remotesToHook = {"ParrySuccessAll", "ParryAttempt", "ParrySuccess", "PlaySound", "PlayVisuals"}
+        while task.wait(1) do
+            for _, remoteName in ipairs(remotesToHook) do
+                local remote = rs.Remotes:FindFirstChild(remoteName)
+                if remote and remote:IsA("RemoteEvent") then
+                    local ok, conns = pcall(getconnections, remote.OnClientEvent)
+                    if ok and type(conns) == "table" then
+                        for _, v in ipairs(conns) do
+                            local func = v.Function
+                            if func and not hookedFuncs[func] then
+                                hookedFuncs[func] = true
+                                v:Disable()
+                                local targetFunc = func
+                                local ourFunc
+                                ourFunc = function(...)
+                                    local args = { ... }
+                                    local isLocal = false
+                                    for _, arg in ipairs(args) do
+                                        if tostring(arg) == LocalPlayer.Name or (typeof(arg) == "Instance" and (arg == LocalPlayer.Character or arg == LocalPlayer)) then
+                                            isLocal = true
+                                            break
+                                        end
+                                    end
+                                    if isLocal and getgenv().skinChanger then
+                                        local fxSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
+                                        refreshSlashName()
+                                        local swordFound = false
+                                        local slashFound = false
+                                        for i, arg in ipairs(args) do
+                                            if type(arg) == "string" then
+                                                if fxSword ~= "" and not slashFound and (arg:match("Slash") or arg == "Default" or arg:match("Effect")) then
+                                                    args[i] = getgenv().slashName
+                                                    slashFound = true
+                                                elseif fxSword ~= "" and not swordFound then
+                                                    local isSword = false
+                                                    pcall(function()
+                                                        if rs.Shared.ReplicatedInstances.Swords:FindFirstChild(arg) then
+                                                            isSword = true
+                                                        end
+                                                    end)
+                                                    if isSword or arg == LocalPlayer:GetAttribute("CurrentlyEquippedSword") then
+                                                        args[i] = fxSword
+                                                        swordFound = true
+                                                    end
+                                                end
+                                            end
+                                        end
+                                        if fxSword ~= "" and not slashFound and type(args[1]) == "string" then
+                                            args[1] = getgenv().slashName
+                                        end
+                                        if fxSword ~= "" and not swordFound and type(args[3]) == "string" then
+                                            args[3] = fxSword
+                                        end
+                                    end
+                                    if setthreadidentity then pcall(setthreadidentity, 2) end
+                                    pcall(targetFunc, unpack(args))
+                                end
+                                hookedFuncs[ourFunc] = true
+                                remote.OnClientEvent:Connect(ourFunc)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    getgenv().updateSword = function()
+        refreshSlashName()
+        if getgenv().skinChanger and getgenv().swordModel ~= "" and getgenv().saveLastEquippedSword then
+            getgenv().saveLastEquippedSword(getgenv().swordModel)
+        end
+        setSword()
+    end
+    task.spawn(function()
+        while task.wait(1) do
+            if getgenv().skinChanger and getgenv().swordModel ~= "" then
+                local char = LocalPlayer.Character
+                if char then
+                    if LocalPlayer:GetAttribute("CurrentlyEquippedSword") ~= getgenv().swordModel then setSword() end
+                    if not char:FindFirstChild(getgenv().swordModel) then setSword() end
+                    for _, v in pairs(char:GetChildren()) do
+                        if v:IsA("Model") and v.Name ~= getgenv().swordModel then v:Destroy() end
+                        task.wait()
+                    end
+                end
+            end
+        end
+    end)
+    LocalPlayer.CharacterAdded:Connect(function()
+        if getgenv().skinChanger then
+            getgenv().skinChanger = false
+            if getgenv().setSkinChangerToggleUI then getgenv().setSkinChangerToggleUI(false) end
+            task.wait(2)
+            getgenv().skinChanger = true
+            if getgenv().setSkinChangerToggleUI then getgenv().setSkinChangerToggleUI(true) end
+            task.wait(0.5)
+            pcall(function() getgenv().updateSword() end)
+        end
+    end)
+end)
+
+print("[Seraphim] 6b. sword skin ready")
+
+-- ============================================================
+-- PART 2 CONTINUES — paste the explosion system + emote system
+-- from your unlock file (wSuhUFTr) here, then Part 2 below.
+-- ============================================================
+
+-- -- ============================================================
+-- FFLAG HELPERS
+-- ============================================================
+local FFLAG_FILE = "Seraphim/fflags.json"
+pcall(function()
+    if makefolder and not isfolder("Seraphim") then makefolder("Seraphim") end
+end)
+
+local function loadFFlagsMap()
+    local map = getgenv()._SeraphimFFlags or {}
+    pcall(function()
+        if isfile and isfile(FFLAG_FILE) then
+            local d = HttpService:JSONDecode(readfile(FFLAG_FILE))
+            if type(d) == "table" then map = d end
+        end
+    end)
+    getgenv()._SeraphimFFlags = map
+    return map
+end
+
+local function saveFFlags(map)
+    pcall(function()
+        if writefile then writefile(FFLAG_FILE, HttpService:JSONEncode(map)) end
+    end)
+end
+
+local function applyFFlag(name, value)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return false, "empty name" end
+    local ok, err = pcall(function()
+        if setfflag then setfflag(name, tostring(value))
+        elseif setfflags then setfflags(name, tostring(value))
+        else error("executor has no setfflag") end
+    end)
+    if ok then
+        local map = loadFFlagsMap()
+        map[name] = tostring(value)
+        saveFFlags(map)
+        getgenv()._SeraphimFFlags = map
+    end
+    return ok, err
+end
+
+task.spawn(function()
+    for k, v in pairs(loadFFlagsMap()) do pcall(applyFFlag, k, v) end
+end)
+
+-- ============================================================
+-- PASTE YOUR EXPLOSION SYSTEM HERE
+-- ============================================================
+-- Copy from your unlock file: everything from
+--   task.spawn(function()
+--       local rs = game:GetService("ReplicatedStorage")
+--       local explosionHookedFuncs = {}
+-- down to the matching end of that task.spawn (just before the line
+--   getgenv().selectedEmote = getgenv().selectedEmote or ""
+-- in your original file).
+
+-- ============================================================
+-- PASTE YOUR EMOTE SYSTEM HERE
+-- ============================================================
+-- Copy from your unlock file: everything from
+--   getgenv().selectedEmote = getgenv().selectedEmote or ""
+-- down to the final
+--   end)()
+
+-- ============================================================
+-- NEVERLOSE UI
+-- ============================================================
+local function loadUI()
+    local url = "https://raw.githubusercontent.com/AchaoticSoftworksCore/AchaoticAssets/main/UiLibrarys/NEVERLOSE-UI-Nightly.luau"
+    local src
+    if game.HttpGet then
+        src = game:HttpGet(url)
+    elseif syn and syn.request then
+        src = syn.request({ Url = url, Method = "GET" }).Body
+    elseif http_request then
+        src = http_request({ Url = url, Method = "GET" }).Body
+    elseif request then
+        src = request({ Url = url, Method = "GET" }).Body
+    end
+    assert(src and #src > 50, "NEVERLOSE download failed")
+    return loadstring(src)()
+end
+
+task.spawn(function()
+    local NEVERLOSE
+    local ok, err = pcall(function() NEVERLOSE = loadUI() end)
+    if not ok or not NEVERLOSE then
+        warn("[Seraphim] UI failed:", err)
+        return
+    end
+    pcall(function() NEVERLOSE:Theme("Dark") end)
+    local Notify = NEVERLOSE:Notification()
+
+    local function n(kind, title, body, t)
+        pcall(function() Notify:Notify(kind or "info", title or "Seraphim", body or "", t or 3) end)
+    end
+    getgenv()._SeraphimNotify = n
+
+    local Window = NEVERLOSE:AddWindow("Seraphim", "Blade Ball", UDim2.new(0.24, 220, 0.32, 180))
+    local MainTab   = Window:AddTab("Main", "ads")
+    local AntiTab   = Window:AddTab("Anti", "list")
+    local VisualTab = Window:AddTab("Visual", "folder")
+    local UnlockTab = Window:AddTab("Unlock", "star")
+    local FlagTab   = Window:AddTab("FFlags", "folder")
+
+    local MainSec   = MainTab:AddSection("Auto Parry", "left")
+    local CurveSec  = MainTab:AddSection("Curves", "right")
+    local AntiSec   = AntiTab:AddSection("Detections", "left")
+    local VisualSec = VisualTab:AddSection("Visuals", "left")
+    local UnlockSec = UnlockTab:AddSection("Unlock All", "left")
+    local EmoteSec  = UnlockTab:AddSection("Emotes", "right")
+    local FlagSec   = FlagTab:AddSection("Flags", "left")
+
+    -- ==========================================
+    -- MAIN TAB
+    -- ==========================================
+    MainSec:AddToggle("Enable Auto Parry", false, function(state)
+        local fully = _PARRY_PATCH.ready and _PARRY_PATCH.parryRemote
+            and _PARRY_PATCH.keyTable and _PARRY_PATCH.transformFn
+        if state and not fully then
+            n("warning", "Not Armed", "Parry once in a real match first", 4)
+            Config.Enabled = false
+            return
+        end
+        Config.Enabled = state
+        if state then
+            startAP()
+            n("success", "Auto Parry", "ON", 2)
+        else
+            stopAP()
+            n("info", "Auto Parry", "OFF", 2)
+        end
+    end)
+
+    MainSec:AddButton("Check Remote", function()
+        local ok = _PARRY_PATCH.ready
+            and _PARRY_PATCH.parryRemote ~= nil
+            and _PARRY_PATCH.keyTable ~= nil
+            and _PARRY_PATCH.transformFn ~= nil
+            and _PARRY_PATCH.parryHash ~= nil
+        if ok then
+            n("success", "Armed", "Remote: " .. tostring(_PARRY_PATCH.parryRemote.Name), 3)
+        else
+            local missing = {}
+            if not _PARRY_PATCH.parryRemote then table.insert(missing, "remote") end
+            if not _PARRY_PATCH.keyTable then table.insert(missing, "keys") end
+            if not _PARRY_PATCH.transformFn then table.insert(missing, "transform") end
+            if not _PARRY_PATCH.ready then table.insert(missing, "manual parry") end
+            n("warning", "Not Armed", table.concat(missing, ", ") .. " - parry once", 5)
+        end
+    end)
+
+    CurveSec:AddDropdown("Curve Method", {
+        "Camera", "Left", "Right", "Back", "High", "Low", "Random"
+    }, "Camera", function(val)
+        Config.CurveMode = val
+        n("info", "Curve", tostring(val), 2)
+    end)
+
+    local SpamSec = MainTab:AddSection("Spam", "left")
+    SpamSec:AddToggle("Spam Button", false, function(state)
+        Config.ManualSpam = state
+        if state then createSpamButton() else destroySpamButton() end
+    end)
+    SpamSec:AddSlider("Spam CPS", 20, 500, 20, function(v)
+        Config.SpamCPS = v
+    end)
+
+    -- ==========================================
+    -- ANTI TAB
+    -- ==========================================
+    AntiSec:AddToggle("Anti Curve", false, function(state)
+        Config.AntiCurve = state
+        n("info", "Anti Curve", state and "ON" or "OFF", 2)
+    end)
+
+    -- ==========================================
+    -- UNLOCK TAB
+    -- ==========================================
+    local function unlockEverything()
+        getgenv().skinChanger = true
+        getgenv().explosionChanger = true
+        if getgenv().setBladeBallEmoteUnlock then
+            task.spawn(function() getgenv().setBladeBallEmoteUnlock(true) end)
+        else
+            getgenv().emoteVFXEnabled = true
+        end
+        if getgenv().refreshBladeBallEmotes then
+            task.spawn(function() getgenv().refreshBladeBallEmotes() end)
+        end
+        if getgenv().installBladeBallEmoteWheel then
+            task.spawn(function() getgenv().installBladeBallEmoteWheel() end)
+        end
+        if getgenv().updateSword then
+            task.spawn(function() getgenv().updateSword() end)
+        end
+        if getgenv().updateExplosion then
+            task.spawn(function() getgenv().updateExplosion() end)
+        end
+    end
+
+    UnlockSec:AddButton("Unlock Everything", function()
+        unlockEverything()
+        n("success", "Unlock All", "Swords + Explosions + Emotes", 4)
+    end)
+
+    UnlockSec:AddToggle("Unlock Swords", false, function(state)
+        getgenv().skinChanger = state
+        if state and getgenv().updateSword then
+            task.spawn(function() getgenv().updateSword() end)
+        end
+        n(state and "success" or "info", "Sword Unlock", state and "ON" or "OFF", 2)
+    end)
+
+    UnlockSec:AddToggle("Unlock Explosions", false, function(state)
+        getgenv().explosionChanger = state
+        if state and getgenv().updateExplosion then
+            task.spawn(function() getgenv().updateExplosion() end)
+        end
+        n(state and "success" or "info", "Explosion Unlock", state and "ON" or "OFF", 2)
+    end)
+
+    UnlockSec:AddButton("Reapply Sword", function()
+        if getgenv().updateSword then
+            task.spawn(function() getgenv().updateSword() end)
+            n("success", "Sword", "Reapplied", 2)
+        else
+            n("warning", "Sword", "Not initialized", 3)
+        end
+    end)
+
+    UnlockSec:AddButton("Test Explosion", function()
+        if getgenv().testExplosion then
+            local ok = getgenv().testExplosion()
+            n(ok and "success" or "error", "Explosion", ok and "Played" or "Failed", 3)
+        else
+            n("error", "Explosion", "Not initialized", 3)
+        end
+    end)
+
+    EmoteSec:AddToggle("Emote Unlock All", false, function(state)
+        if getgenv().setBladeBallEmoteUnlock then
+            getgenv().setBladeBallEmoteUnlock(state)
+            n(state and "success" or "info", "Emote Unlock", state and "ON" or "OFF", 2)
+        else
+            n("error", "Emote Unlock", "Not initialized yet", 3)
+        end
+    end)
+
+    EmoteSec:AddToggle("Emote VFX", false, function(state)
+        getgenv().emoteVFXEnabled = state
+        n(state and "success" or "info", "Emote VFX", state and "ON" or "OFF", 2)
+    end)
+
+    EmoteSec:AddButton("Refresh Emote List", function()
+        local names = getgenv().refreshBladeBallEmotes and getgenv().refreshBladeBallEmotes() or {}
+        n("success", "Emotes", "Refreshed: " .. tostring(#names), 3)
+    end)
+
+    -- ==========================================
+    -- FFLAGS TAB
+    -- ==========================================
+    FlagSec:AddButton("Rejoin (load FFlags)", function()
+        n("info", "Rejoin", "Teleporting...", 2)
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end)
+
+    getgenv().SeraphimSetFlag = function(name, value)
+        local ok, err = applyFFlag(name, value)
+        if ok then
+            n("success", "FFlag", tostring(name) .. " = " .. tostring(value), 3)
+        else
+            n("error", "FFlag Fail", tostring(err), 4)
+        end
+        return ok
+    end
+end)
+
+getgenv().Seraphim = {
+    Config = Config,
+    Patch = _PARRY_PATCH,
+    Fire = fireParry,
+    Start = startAP,
+    Stop = stopAP,
+}
+
+print("[Seraphim] 10. DONE")
