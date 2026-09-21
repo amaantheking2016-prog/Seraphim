@@ -52,34 +52,10 @@ local Stats             = game:GetService("Stats")
 local CoreGui           = game:GetService("CoreGui")
 local TeleportService   = game:GetService("TeleportService")
 local HttpService       = game:GetService("HttpService")
-local TweenService      = game:GetService("TweenService")
 local LocalPlayer       = Players.LocalPlayer
 
-local function getExecutorGlobal(name)
-    if getgenv and getgenv()[name] ~= nil then return getgenv()[name] end
-    if _G and _G[name] ~= nil then return _G[name] end
-    if shared and shared[name] ~= nil then return shared[name] end
-    if getrenv and getrenv()[name] ~= nil then return getrenv()[name] end
-    local value = nil
-    pcall(function()
-        if gethui then
-            local hui = gethui()
-            if hui and hui[name] ~= nil then value = hui[name] end
-        end
-    end)
-    if value ~= nil then return value end
-    pcall(function()
-        if getfenv then
-            local environment = getfenv(0)
-            if environment and environment[name] ~= nil then value = environment[name] end
-        end
-    end)
-    if value ~= nil then return value end
-    return nil
-end
-
 -- ============================================================
--- PARRY PATCH + INSTA FIND
+-- INSTA FIND REMOTE
 -- ============================================================
 local _PARRY_PATCH = {
     keyTable = nil, transformFn = nil, parryHash = nil,
@@ -103,10 +79,13 @@ task.spawn(function()
     if type(Parry_Function) ~= "function" then warn("[Seraphim] PRY not a function") return end
     local ups = getupvals(Parry_Function)
     if not ups or #ups < 8 then warn("[Seraphim] PRY upvalues too few") return end
+    
     _PARRY_PATCH.keyTable    = ups[3]
     _PARRY_PATCH.transformFn = ups[4]
     _PARRY_PATCH.parryHash   = ups[8]
     print("[Seraphim] 4. PRY harvested")
+    
+    -- INSTA attempt 1: PRY upvalues
     for i, up in ipairs(ups) do
         if typeof(up) == "Instance" and (up:IsA("RemoteEvent") or up:IsA("RemoteFunction")) then
             _PARRY_PATCH.parryRemote = up
@@ -115,6 +94,8 @@ task.spawn(function()
             break
         end
     end
+    
+    -- INSTA attempt 2: SwordsController table
     if not _PARRY_PATCH.ready then
         local ok, scTable = pcall(require, SC)
         if ok and type(scTable) == "table" then
@@ -142,6 +123,8 @@ task.spawn(function()
             end
         end
     end
+    
+    -- INSTA attempt 3: Name-based
     if not _PARRY_PATCH.ready then
         local Remotes = RS:FindFirstChild("Remotes")
         if Remotes then
@@ -163,6 +146,7 @@ task.spawn(function()
             end
         end
     end
+    
     if _PARRY_PATCH.ready then
         print("[Seraphim] INSTA-ARMED:", _PARRY_PATCH.parryRemote.Name)
     else
@@ -170,6 +154,7 @@ task.spawn(function()
     end
 end)
 
+-- Fallback metatable hook (arms automatically if user parries manually)
 do
     local _reverted = {}
     local _hookedMetas = setmetatable({}, {__mode = "k"})
@@ -258,7 +243,7 @@ function _PARRY_PATCH.fire(curveCFrame, screenPositions, mouseLocation)
 end
 
 -- ============================================================
--- CONFIG / STATE
+-- CONFIG & HELPERS
 -- ============================================================
 local Config = {
     Enabled = false, RangeMult = 1.0, Accuracy = 100, MinCooldown = 0.55,
@@ -271,6 +256,7 @@ local function flat(v)
     if f.Magnitude < 1e-4 then return Vector3.new(0, 0, -1) end
     return f.Unit
 end
+
 local function bodyFlatLookRight()
     local char = LocalPlayer.Character
     local root = char and char.PrimaryPart
@@ -279,6 +265,7 @@ local function bodyFlatLookRight()
     if not cam then return Vector3.new(0, 0, -1), Vector3.new(1, 0, 0), Vector3.zero end
     return flat(cam.CFrame.LookVector), flat(cam.CFrame.RightVector), cam.CFrame.Position
 end
+
 local function curveCFrame()
     local cam = workspace.CurrentCamera
     if not cam then return CFrame.new() end
@@ -298,6 +285,7 @@ local function curveCFrame()
     else return cam.CFrame end
     return CFrame.new(origin, aim)
 end
+
 local function screenPositions()
     local cam = workspace.CurrentCamera
     local map = {}
@@ -311,13 +299,16 @@ local function screenPositions()
     end
     return map
 end
+
 local function mouseLoc()
     local m = UserInputService:GetMouseLocation()
     return { m.X, m.Y }
 end
+
 local function fireParry()
     return _PARRY_PATCH.fire(curveCFrame(), screenPositions(), mouseLoc())
 end
+
 local function getBalls()
     local out = {}
     local function collect(folder)
@@ -332,6 +323,7 @@ local function getBalls()
     collect(workspace:FindFirstChild("TrainingBalls"))
     return out
 end
+
 local function getPrimaryBall()
     local balls = workspace:FindFirstChild("Balls")
     if balls then
@@ -341,10 +333,12 @@ local function getPrimaryBall()
     end
     return nil
 end
+
 local function isTargeted(ball)
     local t = ball:GetAttribute("target")
     return t == LocalPlayer.Name or t == LocalPlayer.DisplayName
 end
+
 local function getPing()
     local ok, v = pcall(function()
         return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
@@ -354,6 +348,7 @@ end
 
 local curveState = { lerp_radians = 0, last_warping = 0, curving = 0 }
 local function linear_predict(a, b, t) return a + (b - a) * t end
+
 local function is_curved()
     local ball = getPrimaryBall()
     if not ball then return false end
@@ -394,10 +389,14 @@ local function is_curved()
     return dot < dot_threshold
 end
 
+-- ============================================================
+-- AUTO PARRY LOGIC
+-- ============================================================
 local function divisor_mult()
     local acc = math.clamp(Config.Accuracy or 100, 1, 100)
     return 0.7 + (acc - 1) * 0.0035353535353535
 end
+
 local function tryParry(ball)
     local now = tick()
     if State.parried or now < State.lockedUntil then return end
@@ -417,10 +416,12 @@ local function tryParry(ball)
     local speed_divisor = (2.4 + capped * 0.002) * divisor_mult()
     local parry_accuracy = (ping_threshold + math.max(speed / math.max(speed_divisor, 0.4), 9.5)) * Config.RangeMult
     if distance > parry_accuracy then return end
+
     State.parried = true
     State.lastParry = now
     State.lockedUntil = now + Config.MinCooldown
     fireParry()
+
     pcall(function()
         ball:GetAttributeChangedSignal("target"):Once(function()
             State.parried = false
@@ -429,6 +430,7 @@ local function tryParry(ball)
     end)
     task.delay(math.max(Config.MinCooldown, 0.6), function() State.parried = false end)
 end
+
 local function startAP()
     if State.conn then State.conn:Disconnect() end
     State.conn = RunService.Heartbeat:Connect(function()
@@ -440,6 +442,7 @@ local function startAP()
         end
     end)
 end
+
 local function stopAP()
     if State.conn then State.conn:Disconnect() State.conn = nil end
     State.parried = false
@@ -577,266 +580,12 @@ end
 print("[Seraphim] 6. parry systems ready")
 
 -- ============================================================
--- UNLOCK CODE (config + sword skin)
--- ============================================================
-local SKIN_LAST_EQUIPPED_CONFIG_KEY = "Skin.LastEquippedSword"
-local EXPLOSION_LAST_EQUIPPED_CONFIG_KEY = "Skin.LastEquippedExplosion"
-local AUTO_CONFIG_FILE = "UnlockSuite/auto_config.json"
-
-local function readUnlockSuiteAutoConfig()
-    local data = {}
-    pcall(function()
-        if isfile and isfile(AUTO_CONFIG_FILE) then
-            local decoded = HttpService:JSONDecode(readfile(AUTO_CONFIG_FILE))
-            if type(decoded) == "table" then data = decoded end
-        end
-    end)
-    return data
-end
-local function writeUnlockSuiteAutoConfig(data)
-    pcall(function()
-        if isfolder and makefolder and not isfolder("UnlockSuite") then makefolder("UnlockSuite") end
-        if writefile then writefile(AUTO_CONFIG_FILE, HttpService:JSONEncode(data or {})) end
-    end)
-end
-local function loadLastEquippedSword()
-    local data = readUnlockSuiteAutoConfig()
-    local saved = data[SKIN_LAST_EQUIPPED_CONFIG_KEY]
-    return type(saved) == "string" and saved or ""
-end
-local function loadLastEquippedExplosion()
-    local data = readUnlockSuiteAutoConfig()
-    local saved = data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY]
-    return type(saved) == "string" and saved or ""
-end
-getgenv().saveLastEquippedSword = function(swordName)
-    if type(swordName) ~= "string" or swordName == "" then return end
-    local autoConfig = getgenv()._usAutoConfig
-    local data = autoConfig and autoConfig.Data
-    if type(data) ~= "table" then data = readUnlockSuiteAutoConfig() end
-    data[SKIN_LAST_EQUIPPED_CONFIG_KEY] = swordName
-    if autoConfig and type(autoConfig.Data) == "table" then
-        autoConfig.Data[SKIN_LAST_EQUIPPED_CONFIG_KEY] = swordName
-    end
-    writeUnlockSuiteAutoConfig(data)
-end
-getgenv().saveLastEquippedExplosion = function(explosionName)
-    if type(explosionName) ~= "string" or explosionName == "" then return end
-    local autoConfig = getgenv()._usAutoConfig
-    local data = autoConfig and autoConfig.Data
-    if type(data) ~= "table" then data = readUnlockSuiteAutoConfig() end
-    data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY] = explosionName
-    if autoConfig and type(autoConfig.Data) == "table" then
-        autoConfig.Data[EXPLOSION_LAST_EQUIPPED_CONFIG_KEY] = explosionName
-    end
-    writeUnlockSuiteAutoConfig(data)
-end
-do
-    local savedLastSword = loadLastEquippedSword()
-    local savedLastExplosion = loadLastEquippedExplosion()
-    getgenv().skinChanger = getgenv().skinChanger or savedLastSword ~= ""
-    getgenv().swordModel = type(getgenv().swordModel) == "string" and getgenv().swordModel ~= "" and getgenv().swordModel or savedLastSword
-    getgenv().swordAnimations = type(getgenv().swordAnimations) == "string" and getgenv().swordAnimations ~= "" and getgenv().swordAnimations or savedLastSword
-    getgenv().swordFX = type(getgenv().swordFX) == "string" and getgenv().swordFX ~= "" and getgenv().swordFX or savedLastSword
-    getgenv().explosionChanger = getgenv().explosionChanger or savedLastExplosion ~= ""
-    getgenv().explosionFX = type(getgenv().explosionFX) == "string" and getgenv().explosionFX ~= "" and getgenv().explosionFX or savedLastExplosion
-end
-
-task.spawn(function()
-    local rs = game:GetService("ReplicatedStorage")
-    local swordInstancesInstance = rs:WaitForChild("Shared", 9e9):WaitForChild("ReplicatedInstances", 9e9):WaitForChild("Swords", 9e9)
-    local swordInstances = require(swordInstancesInstance)
-    local swordsController
-    task.spawn(function()
-        while task.wait(0.25) and not swordsController do
-            local ok, conns = pcall(getconnections, rs.Remotes.FireSwordInfo.OnClientEvent)
-            if ok and conns then
-                for _, v in ipairs(conns) do
-                    if v.Function and islclosure and islclosure(v.Function) then
-                        local ok2, up = pcall(getupvalues, v.Function)
-                        if ok2 and #up == 1 and type(up[1]) == "table" then
-                            swordsController = up[1]
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    local function getSlashName(swordName)
-        local ok, sln = pcall(function() return swordInstances:GetSword(swordName) end)
-        return (ok and sln and sln.SlashName) or "SlashEffect"
-    end
-    local function refreshSlashName()
-        local fxName = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
-        if fxName ~= "" then
-            getgenv().slashName = getSlashName(fxName)
-        else
-            getgenv().slashName = "SlashEffect"
-        end
-    end
-    refreshSlashName()
-    local function setSword()
-        if not getgenv().skinChanger then return end
-        if not LocalPlayer.Character then return end
-        pcall(function()
-            local f = rawget(swordInstances, "EquipSwordTo")
-            if type(f) == "function" then
-                local ups = getupvalues(f)
-                for i = 1, #ups do
-                    if type(ups[i]) == "boolean" then
-                        setupvalue(f, i, false)
-                        break
-                    end
-                end
-            end
-        end)
-        pcall(function()
-            swordInstances:EquipSwordTo(LocalPlayer.Character, getgenv().swordModel)
-        end)
-        task.spawn(function()
-            local attempts = 0
-            while not swordsController and attempts < 20 do
-                task.wait(0.5); attempts = attempts + 1
-            end
-            if not swordsController then return end
-            pcall(function()
-                if swordsController.SetSword then
-                    swordsController:SetSword(getgenv().swordAnimations ~= "" and getgenv().swordAnimations or getgenv().swordModel)
-                end
-            end)
-            pcall(function()
-                local targetSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
-                if rs.Remotes:FindFirstChild("FireSwordInfo") then
-                    rs.Remotes.FireSwordInfo:FireServer(targetSword)
-                end
-                if swordsController.currentSword ~= nil then
-                    pcall(function() swordsController.currentSword = targetSword end)
-                end
-                if swordsController.SwordFX ~= nil then
-                    pcall(function() swordsController.SwordFX = targetSword end)
-                end
-            end)
-        end)
-    end
-    local hookedFuncs = {}
-    task.spawn(function()
-        local remotesToHook = {"ParrySuccessAll", "ParryAttempt", "ParrySuccess", "PlaySound", "PlayVisuals"}
-        while task.wait(1) do
-            for _, remoteName in ipairs(remotesToHook) do
-                local remote = rs.Remotes:FindFirstChild(remoteName)
-                if remote and remote:IsA("RemoteEvent") then
-                    local ok, conns = pcall(getconnections, remote.OnClientEvent)
-                    if ok and type(conns) == "table" then
-                        for _, v in ipairs(conns) do
-                            local func = v.Function
-                            if func and not hookedFuncs[func] then
-                                hookedFuncs[func] = true
-                                v:Disable()
-                                local targetFunc = func
-                                local ourFunc
-                                ourFunc = function(...)
-                                    local args = { ... }
-                                    local isLocal = false
-                                    for _, arg in ipairs(args) do
-                                        if tostring(arg) == LocalPlayer.Name or (typeof(arg) == "Instance" and (arg == LocalPlayer.Character or arg == LocalPlayer)) then
-                                            isLocal = true
-                                            break
-                                        end
-                                    end
-                                    if isLocal and getgenv().skinChanger then
-                                        local fxSword = getgenv().swordFX ~= "" and getgenv().swordFX or getgenv().swordModel
-                                        refreshSlashName()
-                                        local swordFound = false
-                                        local slashFound = false
-                                        for i, arg in ipairs(args) do
-                                            if type(arg) == "string" then
-                                                if fxSword ~= "" and not slashFound and (arg:match("Slash") or arg == "Default" or arg:match("Effect")) then
-                                                    args[i] = getgenv().slashName
-                                                    slashFound = true
-                                                elseif fxSword ~= "" and not swordFound then
-                                                    local isSword = false
-                                                    pcall(function()
-                                                        if rs.Shared.ReplicatedInstances.Swords:FindFirstChild(arg) then
-                                                            isSword = true
-                                                        end
-                                                    end)
-                                                    if isSword or arg == LocalPlayer:GetAttribute("CurrentlyEquippedSword") then
-                                                        args[i] = fxSword
-                                                        swordFound = true
-                                                    end
-                                                end
-                                            end
-                                        end
-                                        if fxSword ~= "" and not slashFound and type(args[1]) == "string" then
-                                            args[1] = getgenv().slashName
-                                        end
-                                        if fxSword ~= "" and not swordFound and type(args[3]) == "string" then
-                                            args[3] = fxSword
-                                        end
-                                    end
-                                    if setthreadidentity then pcall(setthreadidentity, 2) end
-                                    pcall(targetFunc, unpack(args))
-                                end
-                                hookedFuncs[ourFunc] = true
-                                remote.OnClientEvent:Connect(ourFunc)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    getgenv().updateSword = function()
-        refreshSlashName()
-        if getgenv().skinChanger and getgenv().swordModel ~= "" and getgenv().saveLastEquippedSword then
-            getgenv().saveLastEquippedSword(getgenv().swordModel)
-        end
-        setSword()
-    end
-    task.spawn(function()
-        while task.wait(1) do
-            if getgenv().skinChanger and getgenv().swordModel ~= "" then
-                local char = LocalPlayer.Character
-                if char then
-                    if LocalPlayer:GetAttribute("CurrentlyEquippedSword") ~= getgenv().swordModel then setSword() end
-                    if not char:FindFirstChild(getgenv().swordModel) then setSword() end
-                    for _, v in pairs(char:GetChildren()) do
-                        if v:IsA("Model") and v.Name ~= getgenv().swordModel then v:Destroy() end
-                        task.wait()
-                    end
-                end
-            end
-        end
-    end)
-    LocalPlayer.CharacterAdded:Connect(function()
-        if getgenv().skinChanger then
-            getgenv().skinChanger = false
-            if getgenv().setSkinChangerToggleUI then getgenv().setSkinChangerToggleUI(false) end
-            task.wait(2)
-            getgenv().skinChanger = true
-            if getgenv().setSkinChangerToggleUI then getgenv().setSkinChangerToggleUI(true) end
-            task.wait(0.5)
-            pcall(function() getgenv().updateSword() end)
-        end
-    end)
-end)
-
-print("[Seraphim] 6b. sword skin ready")
-
--- ============================================================
--- PART 2 CONTINUES — paste the explosion system + emote system
--- from your unlock file (wSuhUFTr) here, then Part 2 below.
--- ============================================================
-
--- -- ============================================================
--- FFLAG HELPERS
+-- FFLAGS
 -- ============================================================
 local FFLAG_FILE = "Seraphim/fflags.json"
 pcall(function()
     if makefolder and not isfolder("Seraphim") then makefolder("Seraphim") end
 end)
-
 local function loadFFlagsMap()
     local map = getgenv()._SeraphimFFlags or {}
     pcall(function()
@@ -848,13 +597,11 @@ local function loadFFlagsMap()
     getgenv()._SeraphimFFlags = map
     return map
 end
-
 local function saveFFlags(map)
     pcall(function()
         if writefile then writefile(FFLAG_FILE, HttpService:JSONEncode(map)) end
     end)
 end
-
 local function applyFFlag(name, value)
     name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if name == "" then return false, "empty name" end
@@ -871,29 +618,9 @@ local function applyFFlag(name, value)
     end
     return ok, err
 end
-
 task.spawn(function()
     for k, v in pairs(loadFFlagsMap()) do pcall(applyFFlag, k, v) end
 end)
-
--- ============================================================
--- PASTE YOUR EXPLOSION SYSTEM HERE
--- ============================================================
--- Copy from your unlock file: everything from
---   task.spawn(function()
---       local rs = game:GetService("ReplicatedStorage")
---       local explosionHookedFuncs = {}
--- down to the matching end of that task.spawn (just before the line
---   getgenv().selectedEmote = getgenv().selectedEmote or ""
--- in your original file).
-
--- ============================================================
--- PASTE YOUR EMOTE SYSTEM HERE
--- ============================================================
--- Copy from your unlock file: everything from
---   getgenv().selectedEmote = getgenv().selectedEmote or ""
--- down to the final
---   end)()
 
 -- ============================================================
 -- NEVERLOSE UI
@@ -933,23 +660,17 @@ task.spawn(function()
     local MainTab   = Window:AddTab("Main", "ads")
     local AntiTab   = Window:AddTab("Anti", "list")
     local VisualTab = Window:AddTab("Visual", "folder")
-    local UnlockTab = Window:AddTab("Unlock", "star")
     local FlagTab   = Window:AddTab("FFlags", "folder")
 
     local MainSec   = MainTab:AddSection("Auto Parry", "left")
     local CurveSec  = MainTab:AddSection("Curves", "right")
     local AntiSec   = AntiTab:AddSection("Detections", "left")
     local VisualSec = VisualTab:AddSection("Visuals", "left")
-    local UnlockSec = UnlockTab:AddSection("Unlock All", "left")
-    local EmoteSec  = UnlockTab:AddSection("Emotes", "right")
     local FlagSec   = FlagTab:AddSection("Flags", "left")
 
-    -- ==========================================
     -- MAIN TAB
-    -- ==========================================
     MainSec:AddToggle("Enable Auto Parry", false, function(state)
-        local fully = _PARRY_PATCH.ready and _PARRY_PATCH.parryRemote
-            and _PARRY_PATCH.keyTable and _PARRY_PATCH.transformFn
+        local fully = _PARRY_PATCH.ready and _PARRY_PATCH.parryRemote and _PARRY_PATCH.keyTable and _PARRY_PATCH.transformFn
         if state and not fully then
             n("warning", "Not Armed", "Parry once in a real match first", 4)
             Config.Enabled = false
@@ -966,10 +687,8 @@ task.spawn(function()
     end)
 
     MainSec:AddButton("Check Remote", function()
-        local ok = _PARRY_PATCH.ready
-            and _PARRY_PATCH.parryRemote ~= nil
-            and _PARRY_PATCH.keyTable ~= nil
-            and _PARRY_PATCH.transformFn ~= nil
+        local ok = _PARRY_PATCH.ready and _PARRY_PATCH.parryRemote ~= nil
+            and _PARRY_PATCH.keyTable ~= nil and _PARRY_PATCH.transformFn ~= nil
             and _PARRY_PATCH.parryHash ~= nil
         if ok then
             n("success", "Armed", "Remote: " .. tostring(_PARRY_PATCH.parryRemote.Name), 3)
@@ -999,100 +718,13 @@ task.spawn(function()
         Config.SpamCPS = v
     end)
 
-    -- ==========================================
     -- ANTI TAB
-    -- ==========================================
     AntiSec:AddToggle("Anti Curve", false, function(state)
         Config.AntiCurve = state
         n("info", "Anti Curve", state and "ON" or "OFF", 2)
     end)
 
-    -- ==========================================
-    -- UNLOCK TAB
-    -- ==========================================
-    local function unlockEverything()
-        getgenv().skinChanger = true
-        getgenv().explosionChanger = true
-        if getgenv().setBladeBallEmoteUnlock then
-            task.spawn(function() getgenv().setBladeBallEmoteUnlock(true) end)
-        else
-            getgenv().emoteVFXEnabled = true
-        end
-        if getgenv().refreshBladeBallEmotes then
-            task.spawn(function() getgenv().refreshBladeBallEmotes() end)
-        end
-        if getgenv().installBladeBallEmoteWheel then
-            task.spawn(function() getgenv().installBladeBallEmoteWheel() end)
-        end
-        if getgenv().updateSword then
-            task.spawn(function() getgenv().updateSword() end)
-        end
-        if getgenv().updateExplosion then
-            task.spawn(function() getgenv().updateExplosion() end)
-        end
-    end
-
-    UnlockSec:AddButton("Unlock Everything", function()
-        unlockEverything()
-        n("success", "Unlock All", "Swords + Explosions + Emotes", 4)
-    end)
-
-    UnlockSec:AddToggle("Unlock Swords", false, function(state)
-        getgenv().skinChanger = state
-        if state and getgenv().updateSword then
-            task.spawn(function() getgenv().updateSword() end)
-        end
-        n(state and "success" or "info", "Sword Unlock", state and "ON" or "OFF", 2)
-    end)
-
-    UnlockSec:AddToggle("Unlock Explosions", false, function(state)
-        getgenv().explosionChanger = state
-        if state and getgenv().updateExplosion then
-            task.spawn(function() getgenv().updateExplosion() end)
-        end
-        n(state and "success" or "info", "Explosion Unlock", state and "ON" or "OFF", 2)
-    end)
-
-    UnlockSec:AddButton("Reapply Sword", function()
-        if getgenv().updateSword then
-            task.spawn(function() getgenv().updateSword() end)
-            n("success", "Sword", "Reapplied", 2)
-        else
-            n("warning", "Sword", "Not initialized", 3)
-        end
-    end)
-
-    UnlockSec:AddButton("Test Explosion", function()
-        if getgenv().testExplosion then
-            local ok = getgenv().testExplosion()
-            n(ok and "success" or "error", "Explosion", ok and "Played" or "Failed", 3)
-        else
-            n("error", "Explosion", "Not initialized", 3)
-        end
-    end)
-
-    EmoteSec:AddToggle("Emote Unlock All", false, function(state)
-        if getgenv().setBladeBallEmoteUnlock then
-            getgenv().setBladeBallEmoteUnlock(state)
-            n(state and "success" or "info", "Emote Unlock", state and "ON" or "OFF", 2)
-        else
-            n("error", "Emote Unlock", "Not initialized yet", 3)
-        end
-    end)
-
-    EmoteSec:AddToggle("Emote VFX", false, function(state)
-        getgenv().emoteVFXEnabled = state
-        n(state and "success" or "info", "Emote VFX", state and "ON" or "OFF", 2)
-    end)
-
-    EmoteSec:AddButton("Refresh Emote List", function()
-        local names = getgenv().refreshBladeBallEmotes and getgenv().refreshBladeBallEmotes() or {}
-        n("success", "Emotes", "Refreshed: " .. tostring(#names), 3)
-    end)
-
-    -- ==========================================
     -- FFLAGS TAB
-    -- ==========================================
     FlagSec:AddButton("Rejoin (load FFlags)", function()
         n("info", "Rejoin", "Teleporting...", 2)
         pcall(function()
