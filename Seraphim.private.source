@@ -1,0 +1,2598 @@
+--[[
+    Seraphim v5 — NeverLose UI Edition
+    Rebuilt for reliability, performance, and NeverLose visual identity.
+    Five chunks. Concatenate in order. Run when all five are present.
+]]
+
+local _ok, _err = pcall(function()
+
+pcall(function() setfpscap(9999) end)
+
+-- ====================== SERVICES =========================================
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = (cloneref and cloneref(game:GetService("ReplicatedStorage")))
+                          or game:GetService("ReplicatedStorage")
+local UserInputServiceX = game:GetService("UserInputService")
+local Stats             = game:GetService("Stats")
+local CoreGuiX          = game:GetService("CoreGui")
+local Debris            = game:GetService("Debris")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local TweenServiceX     = game:GetService("TweenService")
+local LocalPlayer       = Players.LocalPlayer
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+local Alive   = workspace:FindFirstChild("Alive")   or workspace:WaitForChild("Alive")
+local Runtime = workspace:FindFirstChild("Runtime") or workspace:WaitForChild("Runtime")
+
+-- ====================== LOG / SAFE =======================================
+local LOG_PREFIX = "[Seraphim]"
+local function log(fmt, ...)
+    local ok, msg = pcall(string.format, fmt, ...)
+    print(LOG_PREFIX, ok and msg or fmt)
+end
+local function safe(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then log("ERROR: %s", tostring(err)) end
+    return ok, err
+end
+local function safeGet(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then log("ERROR: %s", tostring(res)); return nil end
+    return res
+end
+
+-- ====================== CONFIG ===========================================
+local CFG = {
+    hudHz            = 6,
+    parryLockSeconds = 0.05,
+    parryResetSeconds = 0.9,
+    spamHardCapCps   = 2000,
+    defaultRemoteCps = 100,
+    defaultSpamCps   = 150,
+    defaultTurboCps  = 150,
+    defaultMacroCps  = 100,
+    defaultParryThreshold = 2.5,
+    triggerbotDelay  = 0.5,
+    accuracyLocked   = 0.8307070707070668, -- [ANGELI] DO NOT CHANGE
+    pingCacheTTL     = 0.5,
+    statsWindowSec   = 3.0,
+    errorBudget      = 12,
+    errorWindowSec   = 10.0,
+    maxRealBalls     = 32,
+}
+local Config = {
+    Enabled = false, CurveMode = "camera", RandomTarget = false,
+    ManualSpam = false, ManualCPSEnabled = true,
+    ManualCPS = CFG.defaultRemoteCps, SpamCPS = CFG.defaultSpamCps,
+    AutoParryMode = "Remote",
+    FractureAutoAbility = true,
+    SupportTrainingBalls = true,
+}
+
+-- ====================== PING CACHE =======================================
+local PingCache = { value = 50, updatedAt = 0, ttl = CFG.pingCacheTTL }
+function PingCache.get()
+    local now = tick()
+    if now - PingCache.updatedAt < PingCache.ttl then return PingCache.value end
+    local ok, v = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+    if ok and type(v) == "number" and v > 0 then
+        PingCache.value = v
+        PingCache.updatedAt = now
+    end
+    return PingCache.value
+end
+
+-- ====================== ADAPTIVE PING MODEL ==============================
+local PingModel = { samples = {}, capacity = 48, head = 0, mean = 50, variance = 0, lastSample = 0, minInterval = 0.05 }
+function PingModel.sample()
+    local now = tick()
+    if now - PingModel.lastSample < PingModel.minInterval then return end
+    PingModel.lastSample = now
+    local ok, v = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+    if not ok or type(v) ~= "number" or v <= 0 then return end
+    local i = (PingModel.head % PingModel.capacity) + 1
+    PingModel.head = i
+    PingModel.samples[i] = v
+    local n, sum = 0, 0
+    for j = 1, PingModel.capacity do
+        local s = PingModel.samples[j]
+        if s then n += 1; sum += s end
+    end
+    if n == 0 then return end
+    local mean = sum / n
+    local var = 0
+    for j = 1, PingModel.capacity do
+        local s = PingModel.samples[j]
+        if s then var += (s - mean)^2 end
+    end
+    PingModel.mean = mean
+    PingModel.variance = var / n
+end
+function PingModel.getBase()
+    PingModel.sample()
+    local sigma = math.sqrt(PingModel.variance)
+    return math.clamp((PingModel.mean + sigma * 0.5) / 10, 5, 17)
+end
+
+-- ====================== REMOTE LAYER =====================================
+local Remote = {
+    HASH = "5455ef47-de02-4074-808c-8d82c2cd12ec",
+    key = nil, fire = nil,
+    captured = { remote = nil, sessionKey = nil, token = nil, args = nil },
+    votes = {},
+    armed = false,
+    corruptStreak = 0,
+    corruptionThreshold = 3,
+}
+do
+    local HASH = Remote.HASH
+    local byte, char = string.byte, string.char
+    local mfloor, bxor = math.floor, bit32.bxor
+
+    local function timestamp()
+        return tostring(mfloor(workspace:GetServerTimeNow() * 100))
+    end
+
+    local function learn(token, stamp)
+        if #token ~= #stamp then return false end
+        for i = 1, #token do
+            local v = bxor(byte(token, i), (byte(stamp, i) + i) % 256)
+            local bucket = Remote.votes[i] or {}
+            Remote.votes[i] = bucket
+            bucket[v] = (bucket[v] or 0) + 1
+        end
+        local nextKey = {}
+        for i = 1, #token do
+            local best, highest = 0, -1
+            for v, c in pairs(Remote.votes[i]) do
+                if c > highest then best, highest = v, c end
+            end
+            nextKey[i] = best
+        end
+        Remote.key = nextKey
+        Remote.armed = true
+        Remote.corruptStreak = 0
+        log("remote armed (%d bytes)", #nextKey)
+        return true
+    end
+
+    function Remote.makeToken()
+        if not Remote.key then return nil end
+        local stamp = timestamp()
+        local out = {}
+        for i = 1, #stamp do
+            local v = Remote.key[i] or Remote.key[#Remote.key]
+            if not v then return nil end
+            out[i] = char(bxor((byte(stamp, i) + i) % 256, v))
+        end
+        if out[1] then
+            local b = byte(out[1])
+            if b < 32 or b > 126 then
+                Remote.corruptStreak += 1
+                if Remote.corruptStreak >= Remote.corruptionThreshold then
+                    Remote.key = nil
+                    Remote.armed = false
+                    Remote.corruptStreak = 0
+                    warn(LOG_PREFIX, "token corruption — re-arm required")
+                end
+                return nil
+            end
+        end
+        return table.concat(out)
+    end
+
+    local hookFn = hookfunction or hookfunc or replaceclosure
+    if not hookFn then
+        warn(LOG_PREFIX, "no hookfunction — remote layer disabled")
+    else
+        local sample = Instance.new("RemoteEvent")
+        Remote.fire = hookFn(sample.FireServer, function(self, ...)
+            local args = table.pack(...)
+            if args[1] == HASH and type(args[3]) == "string" then
+                local prev = Remote.captured.remote
+                Remote.captured.remote = self
+                Remote.captured.sessionKey = args[2]
+                Remote.captured.token = args[3]
+                Remote.captured.args = args
+                if prev ~= self then
+                    log("remote changed: %s -> %s", tostring(prev), tostring(self))
+                end
+                if not Remote.armed then
+                    local learned = learn(args[3], timestamp())
+                    log("captured: %s learned=%s", self:GetFullName(), tostring(learned))
+                end
+            end
+            return Remote.fire(self, ...)
+        end)
+        sample:Destroy()
+        log("hook installed — parry once in-game to arm")
+    end
+end
+
+function Remote.isArmed()
+    return Remote.armed
+       and Remote.captured.remote ~= nil
+       and Remote.captured.sessionKey ~= nil
+       and Remote.key ~= nil
+end
+
+-- ====================== STUB THE REST ====================================
+-- Chunk 2 will define: BallRegistry, ParryState, Stats2, Target, BallHelper
+-- Chunk 3 will define: AutoParry, Triggerbot, ManualSpam, AutoSpam, Macro, Fracture
+-- Chunk 4 will define: Immortal module
+-- Chunk 5 will define: Window, tabs, wiring, exports
+
+--[[
+    ⚠️  DO NOT RUN YET — paste Chunk 2 immediately below this line.
+    Chunk 1 ends here. Chunk 2 begins with "BallRegistry".
+]]-- ====================== BALL REGISTRY ====================================
+-- Incremental real-ball tracking. Zero allocation in the hot path.
+local BallRegistry = {
+    real = {}, training = {},
+    realList = {}, trainingList = {},
+    dirty = true, conns = {},
+}
+local function registryMarkDirty() BallRegistry.dirty = true end
+local function registryRebuild()
+    local r, t = {}, {}
+    for b in pairs(BallRegistry.real) do if b.Parent then r[#r+1] = b end end
+    for b in pairs(BallRegistry.training) do if b.Parent then t[#t+1] = b end end
+    BallRegistry.realList = r
+    BallRegistry.trainingList = t
+    BallRegistry.dirty = false
+end
+local function registryAdd(ball, isTraining)
+    if ball:GetAttribute("realBall") then
+        if isTraining then BallRegistry.training[ball] = true
+        else BallRegistry.real[ball] = true end
+        registryMarkDirty()
+    end
+end
+local function registryRemove(ball)
+    if BallRegistry.real[ball] then BallRegistry.real[ball] = nil; registryMarkDirty() end
+    if BallRegistry.training[ball] then BallRegistry.training[ball] = nil; registryMarkDirty() end
+end
+local function registryInit()
+    local balls = workspace:WaitForChild("Balls")
+    local tb    = workspace:FindFirstChild("TrainingBalls")
+    for _, b in ipairs(balls:GetChildren()) do registryAdd(b, false) end
+    BallRegistry.conns[#BallRegistry.conns+1] = balls.ChildAdded:Connect(function(b) registryAdd(b, false) end)
+    BallRegistry.conns[#BallRegistry.conns+1] = balls.ChildRemoved:Connect(registryRemove)
+    if tb then
+        for _, b in ipairs(tb:GetChildren()) do registryAdd(b, true) end
+        BallRegistry.conns[#BallRegistry.conns+1] = tb.ChildAdded:Connect(function(b) registryAdd(b, true) end)
+        BallRegistry.conns[#BallRegistry.conns+1] = tb.ChildRemoved:Connect(registryRemove)
+    else
+        task.spawn(function()
+            local t = workspace:WaitForChild("TrainingBalls", 30)
+            if not t then return end
+            for _, b in ipairs(t:GetChildren()) do registryAdd(b, true) end
+            BallRegistry.conns[#BallRegistry.conns+1] = t.ChildAdded:Connect(function(b) registryAdd(b, true) end)
+            BallRegistry.conns[#BallRegistry.conns+1] = t.ChildRemoved:Connect(registryRemove)
+        end)
+    end
+end
+registryInit()
+function BallRegistry.iterate()
+    if BallRegistry.dirty then registryRebuild() end
+    return BallRegistry.realList
+end
+function BallRegistry.iterateTraining()
+    if BallRegistry.dirty then registryRebuild() end
+    return BallRegistry.trainingList
+end
+function BallRegistry.first()
+    if BallRegistry.dirty then registryRebuild() end
+    return BallRegistry.realList[1]
+end
+
+-- ====================== PARRY STATE MACHINE =============================
+local ParryState = {
+    status = "IDLE",
+    lockedUntil = 0,
+    lastFireAt = 0,
+    cooldownUntil = 0,
+    inFlight = 0,
+}
+function ParryState.canFire()
+    return ParryState.status ~= "LOCKED"
+       and tick() >= ParryState.lockedUntil
+       and tick() >= ParryState.cooldownUntil
+       and ParryState.inFlight == 0
+end
+function ParryState.markFired()
+    ParryState.inFlight = 1
+    ParryState.lockedUntil = tick() + CFG.parryLockSeconds
+    ParryState.lastFireAt = tick()
+    ParryState.status = "COOLDOWN"
+    task.delay(CFG.parryResetSeconds, function()
+        ParryState.inFlight = 0
+        ParryState.cooldownUntil = 0
+        if ParryState.status == "COOLDOWN" then ParryState.status = "IDLE" end
+    end)
+end
+local ParryMutex = { held = false }
+local function withParryMutex(fn)
+    if ParryMutex.held then return false end
+    ParryMutex.held = true
+    local ok, res = pcall(fn)
+    ParryMutex.held = false
+    return ok and res
+end
+
+-- ====================== STATS2 ===========================================
+local Stats2 = { events = {}, head = 0, capacity = 512 }
+function Stats2.push(kind)
+    local i = (Stats2.head % Stats2.capacity) + 1
+    Stats2.events[i] = { t = tick(), kind = kind }
+    Stats2.head = i
+end
+function Stats2.rate(kind)
+    local now = tick()
+    local cutoff = now - CFG.statsWindowSec
+    local n = 0
+    for i = 1, Stats2.capacity do
+        local e = Stats2.events[i]
+        if e and e.t >= cutoff and (not kind or e.kind == kind) then n = n + 1 end
+    end
+    return n / CFG.statsWindowSec
+end
+function Stats2.errorRate() return Stats2.rate("error") end
+
+-- ====================== TARGET ===========================================
+local Target = { current = nil, recently = {} }
+function Target.pickRandom()
+    local living = {}
+    for _, char in ipairs(workspace.Alive:GetChildren()) do
+        if char.Name ~= LocalPlayer.Name and char.PrimaryPart then
+            living[#living + 1] = char
+        end
+    end
+    if #living == 0 then Target.current = nil; return end
+    if #living == 1 then Target.current = living[1]; return end
+    local candidates = {}
+    for _, c in ipairs(living) do
+        if not Target.recently[c.Name] then candidates[#candidates + 1] = c end
+    end
+    if #candidates == 0 then
+        Target.recently = {}
+        for _, c in ipairs(living) do
+            if not Target.current or c.Name ~= Target.current.Name then
+                candidates[#candidates + 1] = c
+            end
+        end
+        if #candidates == 0 then candidates = living end
+    end
+    local picked = candidates[math.random(1, #candidates)]
+    Target.recently[picked.Name] = true
+    Target.current = picked
+end
+function Target.selectByMouse()
+    local living = {}
+    for _, char in ipairs(workspace.Alive:GetChildren()) do
+        if char.Name ~= LocalPlayer.Name and char.PrimaryPart then
+            living[#living + 1] = char
+        end
+    end
+    local cam = workspace.CurrentCamera
+    local mp  = UserInputServiceX:GetMouseLocation()
+    local ray = cam:ScreenPointToRay(mp.X, mp.Y)
+    local rayDir = ray.Direction
+    local best, bestDot = nil, -math.huge
+    for _, c in ipairs(living) do
+        local dir = (c.PrimaryPart.Position - cam.CFrame.Position).Unit
+        local dot = rayDir:Dot(dir)
+        if dot > bestDot then bestDot = dot; best = c end
+    end
+    Target.current = best
+    return best
+end
+task.spawn(function()
+    local balls = workspace:WaitForChild("Balls")
+    local function watch(b)
+        b:GetAttributeChangedSignal("target"):Connect(function()
+            if Config.RandomTarget then Target.pickRandom() end
+        end)
+    end
+    for _, b in ipairs(balls:GetChildren()) do watch(b) end
+    balls.ChildAdded:Connect(function(b)
+        if Config.RandomTarget then Target.pickRandom() end
+        watch(b)
+    end)
+end)
+
+-- ====================== BALL HELPER ======================================
+local BallHelper = {}
+BallHelper.ball = { properties = {
+    aerodynamic_time = tick(), last_warping = tick(),
+    lerp_radians = 0, curving = tick(),
+}}
+function BallHelper.get_ball()  return BallRegistry.first() end
+function BallHelper.get_balls() return BallRegistry.iterate() end
+function BallHelper.get_training_balls() return BallRegistry.iterateTraining() end
+
+local function linear_predict(a, b, t) return a + (b - a) * t end
+
+local CurveState = setmetatable({}, { __mode = "k" })
+local function getCurveState(ball)
+    local s = CurveState[ball]
+    if not s then
+        s = { aerodynamic_time = tick(), last_warping = tick(), lerp_radians = 0, curving = tick() }
+        CurveState[ball] = s
+    end
+    return s
+end
+
+function BallHelper.ball_curvedFor(ball)
+    if not ball or not ball.Parent then return false end
+    local props = getCurveState(ball)
+    local zoomies = ball:FindFirstChild("zoomies")
+    if not zoomies then return false end
+    local velocity = zoomies.VectorVelocity
+    if not velocity then return false end
+    local speed = velocity.Magnitude
+    if speed <= 0 then return false end
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character.PrimaryPart
+    if not myRoot then return false end
+    local velUnit = velocity.Unit
+    local toMe = (myRoot.Position - ball.Position).Unit
+    local dotProduct = toMe:Dot(velUnit)
+    local speedFactor = math.min(speed / 100, 40)
+    local accelDir = (velUnit - velocity).Unit
+    local crossDot = toMe:Dot(accelDir)
+    local dotDifference = dotProduct - crossDot
+    local distance = (myRoot.Position - ball.Position).Magnitude
+    local pingMs = PingCache.get()
+    local pingThreshold = 0.5 - (pingMs / 1000)
+    local timeToImpact = distance / speed - (pingMs / 1000)
+    local minDistance = 15 - math.min(distance / 1000, 15) + speedFactor
+    local clampedDot = math.clamp(dotProduct, -1, 1)
+    local angleRad = math.rad(math.asin(clampedDot))
+    props.lerp_radians = linear_predict(props.lerp_radians, angleRad, 0.8)
+    if speed > 100 and timeToImpact > pingMs / 10 then
+        minDistance = math.max(minDistance - 15, 15)
+    end
+    if distance < minDistance then return false end
+    if dotDifference < pingThreshold then return true end
+    if props.lerp_radians < 0.018 then props.last_warping = tick() end
+    if (tick() - props.last_warping) < (timeToImpact / 1.5) then return true end
+    if (tick() - props.curving) < (timeToImpact / 1.5) then return true end
+    return dotProduct < pingThreshold
+end
+function BallHelper.ball_curved()
+    return BallHelper.ball_curvedFor(BallRegistry.first())
+end
+
+function BallHelper.getCurveCFrame()
+    local cam = workspace.CurrentCamera
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return cam.CFrame end
+    local method = Config.CurveMode
+    local target = Target.current
+    local targetPos = (target and target.PrimaryPart and target.PrimaryPart.Position)
+        or (hrp.Position + cam.CFrame.LookVector * 1000)
+    local toTarget = (targetPos - hrp.Position)
+    if toTarget.Magnitude < 1e-3 then toTarget = Vector3.new(0, 0, -1) end
+    toTarget = toTarget.Unit
+    if method == "dot" then
+        return CFrame.lookAt(hrp.Position, targetPos + Vector3.new(0, 1.75, 0))
+    elseif method == "backwards" then
+        return CFrame.new(hrp.Position, hrp.Position + (-toTarget) * 1000)
+    elseif method == "slow" then
+        return CFrame.new(hrp.Position, hrp.Position + Vector3.new(0, -350, 0))
+    elseif method == "random" then
+        return CFrame.new(hrp.Position, targetPos + Vector3.new(
+            math.random(-1000, 1000), math.random(-350, 1000), math.random(-1000, 1000)))
+    elseif method == "high" then
+        return CFrame.new(hrp.Position, targetPos + Vector3.new(0, 9e18, 0))
+    elseif method == "accelerated" then
+        return CFrame.new(hrp.Position, targetPos + Vector3.new(0, 5, 0))
+    else
+        return cam.CFrame
+    end
+end
+
+-- ====================== PARRY KEY CAPTURE ================================
+local Parry = { count = 0, keyFn = nil }
+do
+    local SC
+    if ReplicatedStorage:FindFirstChild("Controllers") then
+        for _, child in ipairs(ReplicatedStorage.Controllers:GetChildren()) do
+            if child.Name:match("^SwordsController%s*$") then SC = child end
+        end
+    end
+    safe(function()
+        local pg = LocalPlayer.PlayerGui:FindFirstChild("Hotbar")
+        local blk = pg and pg:FindFirstChild("Block")
+        if blk and SC then
+            for _, v in next, getconnections(blk.Activated) do
+                if getfenv(v.Function).script == SC then
+                    Parry.keyFn = v.Function; break
+                end
+            end
+        end
+    end)
+end
+
+-- ====================== PARRY FIRE =======================================
+local SB = {
+    screen = {}, screenKeys = {}, screenCount = 0,
+    mouseLoc = {0, 0}, fired = 0,
+    lastScreenRefresh = 0, screenTTL = 0.10,
+}
+for i = 1, 32 do SB.screenKeys[i] = false end
+
+local function clearScreen()
+    for i = 1, SB.screenCount do SB.screen[SB.screenKeys[i]] = nil end
+    SB.screenCount = 0
+end
+local function refreshScreen()
+    clearScreen()
+    local alive = workspace.Alive
+    local cam = workspace.CurrentCamera
+    local n = 0
+    for _, c in ipairs(alive:GetChildren()) do
+        local pp = c.PrimaryPart
+        if pp then
+            n += 1
+            SB.screenKeys[n] = c.Name
+            SB.screen[c.Name] = cam:WorldToScreenPoint(pp.Position)
+        end
+    end
+    SB.screenCount = n
+    SB.lastScreenRefresh = tick()
+end
+
+function BallHelper.parry()
+    if not Remote.isArmed() then return false end
+    if not ParryState.canFire() then return false end
+    if not Config.RandomTarget then Target.selectByMouse() end
+    if tick() - SB.lastScreenRefresh > SB.screenTTL then refreshScreen() end
+    local curveCFrame = BallHelper.getCurveCFrame()
+    if Config.RandomTarget and Target.current and Target.current.PrimaryPart then
+        local vp = workspace.CurrentCamera:WorldToViewportPoint(Target.current.PrimaryPart.Position)
+        SB.mouseLoc[1] = vp.X
+        SB.mouseLoc[2] = vp.Y
+    else
+        local mp = UserInputServiceX:GetMouseLocation()
+        SB.mouseLoc[1] = mp.X
+        SB.mouseLoc[2] = mp.Y
+    end
+    local function doFire()
+        local token = Remote.makeToken()
+        if not token then return false end
+        local cap = Remote.captured
+        return safe(function()
+            Remote.fire(cap.remote, Remote.HASH, cap.sessionKey, token,
+                        0.5, curveCFrame, SB.screen, SB.mouseLoc, false)
+        end)
+    end
+    local ok = withParryMutex(doFire)
+    if ok then
+        ParryState.markFired()
+        Allusive.parry.hits = Allusive.parry.hits + 1
+        Allusive.parry.lastSuccess = tick()
+        Stats2.push("parry")
+        SB.fired += 1
+    else
+        Allusive.parry.fails = Allusive.parry.fails + 1
+        Stats2.push("error")
+    end
+    return ok
+end
+
+function BallHelper.parry_keypress()
+    if Parry.keyFn then safe(Parry.keyFn) end
+end
+
+-- ====================== ALLUSIVE STATE ===================================
+local Allusive = {
+    cache = { ping = 50, pingT = 0, ttl = 0.5 },
+    parry = { hits = 0, fails = 0, lastSuccess = 0 },
+    state = {
+        infinityActive = false, deathslashActive = true,
+        timeholeActive = true, tornadoTime = 0,
+        slashesoffuryActive = false, slashesoffuryCount = 0,
+        fractureActive = false,
+    },
+    detection = {
+        infinity = false, deathslash = false,
+        timehole = false, slashesoffury = false, phantom = false,
+        fracture = false,
+    },
+    triggerbot = {
+        enabled = false, isParrying = false,
+        parries = 0, maxParries = 10000, delay = CFG.triggerbotDelay,
+    },
+}
+function Allusive.getPing()
+    local now = tick()
+    if now - Allusive.cache.pingT < Allusive.cache.ttl then
+        return Allusive.cache.ping
+    end
+    local p = 50
+    safe(function() p = Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+    Allusive.cache.ping = p; Allusive.cache.pingT = now
+    return p
+end
+
+-- ====================== DETECTION EVENTS =================================
+safe(function()
+    ReplicatedStorage.Remotes.DeathBall.OnClientEvent:Connect(function(_, d)
+        Allusive.state.deathslashActive = d or false
+    end)
+end)
+safe(function()
+    ReplicatedStorage.Remotes.InfinityBall.OnClientEvent:Connect(function(_, b)
+        Allusive.state.infinityActive = b or false
+    end)
+end)
+
+-- Fracture detection (watches local character's Abilities folder)
+task.spawn(function()
+    while true do
+        task.wait(0.2)
+        safe(function()
+            local char = LocalPlayer.Character
+            if not char then Allusive.state.fractureActive = false; return end
+            local abilities = char:FindFirstChild("Abilities")
+            if not abilities then Allusive.state.fractureActive = false; return end
+            local f = abilities:FindFirstChild("Fracture")
+            Allusive.state.fractureActive = (f ~= nil and f.Enabled == true)
+        end)
+    end
+end)
+
+-- TimeHole / Slashes of Fury
+safe(function()
+    local pkg = ReplicatedStorage:FindFirstChild("Packages")
+    local net = pkg and pkg:FindFirstChild("_Index")
+    net = net and net:FindFirstChild("sleitnick_net@0.1.0")
+    local netf = net and net:FindFirstChild("net")
+    if not netf then return end
+    local thA  = netf:FindFirstChild("RE/TimeHoleActivate")
+    local thD  = netf:FindFirstChild("RE/TimeHoleDeactivate")
+    local sofA = netf:FindFirstChild("RE/SlashesOfFuryActivate")
+    local sofE = netf:FindFirstChild("RE/SlashesOfFuryEnd")
+    local sofP = netf:FindFirstChild("RE/SlashesOfFuryParry")
+    local sofC = netf:FindFirstChild("RE/SlashesOfFuryCatch")
+    if thA then thA.OnClientEvent:Connect(function(p)
+        if p == LocalPlayer or p == LocalPlayer.Name
+        or (p and p.Name == LocalPlayer.Name) then
+            Allusive.state.timeholeActive = true
+        end
+    end) end
+    if thD then thD.OnClientEvent:Connect(function()
+        Allusive.state.timeholeActive = false
+    end) end
+    if sofA then sofA.OnClientEvent:Connect(function(p)
+        if p == LocalPlayer or p == LocalPlayer.Name
+        or (p and p.Name == LocalPlayer.Name) then
+            Allusive.state.slashesoffuryActive = true
+            Allusive.state.slashesoffuryCount = 0
+        end
+    end) end
+    if sofE then sofE.OnClientEvent:Connect(function()
+        Allusive.state.slashesoffuryActive = false
+        Allusive.state.slashesoffuryCount = 0
+    end) end
+    if sofP then sofP.OnClientEvent:Connect(function()
+        Allusive.state.slashesoffuryCount = (Allusive.state.slashesoffuryCount or 0) + 1
+    end) end
+    if sofC then sofC.OnClientEvent:Connect(function()
+        spawn(function()
+            local maxP = 36; local d = 0.05
+            while Allusive.state.slashesoffuryActive
+              and (Allusive.state.slashesoffuryCount or 0) < maxP do
+                if Allusive.detection.slashesoffury then
+                    BallHelper.parry(); task.wait(d)
+                else break end
+            end
+        end)
+    end) end
+end)
+
+--[[
+    ⚠️  DO NOT RUN YET — paste Chunk 3 immediately below this line.
+    Chunk 2 ends here. Chunk 3 begins with "Fracture handler + AutoParry".
+]]-- ====================== FRACTURE HANDLER =================================
+local Fracture = { lastFireAt = 0, cooldown = 4.0, pending = false }
+function Fracture.onDetected()
+    if not Config.FractureAutoAbility then return end
+    local now = tick()
+    if now - Fracture.lastFireAt < Fracture.cooldown then return end
+    if Fracture.pending then return end
+    Fracture.pending = true
+    Fracture.lastFireAt = now
+    task.spawn(function()
+        local ok = pcall(function()
+            ReplicatedStorage.Remotes.AbilityButtonPress:Fire()
+        end)
+        if not ok then Fracture.pending = false; return end
+        task.wait(2.432)
+        pcall(function()
+            local r = ReplicatedStorage:FindFirstChild("Remotes")
+            local ds = r and r:FindFirstChild("DeathSlashShootActivation")
+            if ds then ds:FireServer(true) end
+        end)
+        Fracture.pending = false
+    end)
+end
+
+-- ====================== ABILITY SCHEDULER ================================
+local AbilityScheduler = { currentOwner = nil, ownerUntil = 0 }
+function AbilityScheduler.acquire(owner, duration)
+    local now = tick()
+    if AbilityScheduler.currentOwner and now < AbilityScheduler.ownerUntil then
+        local pri = { timehole = 3, sof = 2, fracture = 1 }
+        if (pri[owner] or 0) <= (pri[AbilityScheduler.currentOwner] or 0) then
+            return false
+        end
+    end
+    AbilityScheduler.currentOwner = owner
+    AbilityScheduler.ownerUntil = now + duration
+    return true
+end
+function AbilityScheduler.release(owner)
+    if AbilityScheduler.currentOwner == owner then
+        AbilityScheduler.currentOwner = nil
+        AbilityScheduler.ownerUntil = 0
+    end
+end
+function AbilityScheduler.isFree()
+    return tick() >= AbilityScheduler.ownerUntil
+end
+
+-- ====================== AUTO PARRY =======================================
+local AutoParry = { conn = nil, running = false }
+
+local function evaluateBall(ball, realBall, props)
+    if not ball or not ball.Parent then return end
+    if not ParryState.canFire() then return end
+
+    local zoomies = ball:FindFirstChild("zoomies")
+    if not zoomies then return end
+
+    if not ball:GetAttribute("_seraphimHooked") then
+        ball:SetAttribute("_seraphimHooked", true)
+        ball:GetAttributeChangedSignal("target"):Connect(function()
+            if Config.RandomTarget then Target.pickRandom() end
+        end)
+    end
+
+    local ballTarget = ball:GetAttribute("target")
+    if ballTarget ~= LocalPlayer.Name then return end
+
+    local char = LocalPlayer.Character
+    local myPart = char and char.PrimaryPart
+    if not myPart then return end
+
+    local velocity = zoomies.VectorVelocity
+    local myPos    = myPart.Position
+    local distance = (myPos - ball.Position).Magnitude
+
+    local pingBase = PingModel.getBase()
+
+    local rawSpeed = velocity.Magnitude
+    local speedAdjusted  = math.min(math.max(rawSpeed - 9.5, 0), 650)
+    local speedCoef      = 2.4 + speedAdjusted * 0.002
+    local scaledAg       = speedCoef * CFG.accuracyLocked
+    local targetDistance = pingBase + math.max(rawSpeed / scaledAg, 9.5)
+
+    local isCurving = BallHelper.ball_curvedFor(ball)
+
+    if ball:FindFirstChild("AeroDynamicSlashVFX") then
+        Debris:AddItem(ball.AeroDynamicSlashVFX, 0)
+        props.aerodynamic_time = tick()
+    end
+
+    local tornado = Runtime:FindFirstChild("Tornado")
+    if tornado then
+        local tt = tornado:GetAttribute("TornadoTime") or 1
+        if (tick() - props.aerodynamic_time) < tt + 0.314159 then return end
+    end
+
+    if realBall:GetAttribute("target") == LocalPlayer.Name
+    and isCurving and distance > 30 then
+        return
+    end
+
+    if distance > targetDistance then return end
+
+    if Allusive.state.fractureActive and Allusive.detection.fracture then
+        Fracture.onDetected()
+        return
+    end
+
+    if Config.AutoParryMode == "Keypress" then
+        if Parry.keyFn then safe(Parry.keyFn) end
+    else
+        BallHelper.parry()
+    end
+end
+
+function AutoParry.start()
+    if AutoParry.conn then return end
+    AutoParry.running = true
+    AutoParry.conn = RunService.PreSimulation:Connect(function()
+        if not AutoParry.running then return end
+        if not Config.Enabled then return end
+        if Allusive.triggerbot.enabled then return end
+        if not Remote.isArmed() then return end
+
+        local char = LocalPlayer.Character
+        if not char or not char.PrimaryPart then return end
+
+        local props = BallHelper.ball.properties
+        local realBall = BallRegistry.first()
+        if not realBall then return end
+
+        local list = BallRegistry.iterate()
+        for i = 1, #list do
+            if i > CFG.maxRealBalls then break end
+            evaluateBall(list[i], realBall, props)
+        end
+
+        if Config.SupportTrainingBalls then
+            local t = BallRegistry.iterateTraining()
+            for i = 1, #t do
+                evaluateBall(t[i], realBall, props)
+            end
+        end
+    end)
+end
+
+function AutoParry.stop()
+    AutoParry.running = false
+    if AutoParry.conn then AutoParry.conn:Disconnect(); AutoParry.conn = nil end
+    Config.Enabled = false
+end
+
+-- ====================== TRIGGERBOT =======================================
+local Triggerbot = { conn = nil }
+local function triggerBall(ball)
+    local tb = Allusive.triggerbot
+    if tb.isParrying or tb.parries > tb.maxParries then return end
+    local char = LocalPlayer.Character
+    if char and char.PrimaryPart and char.PrimaryPart:FindFirstChild("SingularityCape") then return end
+    tb.isParrying = true
+    tb.parries = tb.parries + 1
+    BallHelper.parry()
+    task.delay(tb.delay, function()
+        if tb.parries > 0 then tb.parries = tb.parries - 1 end
+    end)
+    ball:GetAttributeChangedSignal("target"):Once(function() tb.isParrying = false end)
+    task.delay(1, function() tb.isParrying = false end)
+end
+local function triggerLoop()
+    local tb = Allusive.triggerbot
+    if not tb.enabled then return end
+    if not Remote.isArmed() then return end
+    local char = LocalPlayer.Character
+    if char and char.PrimaryPart and char.PrimaryPart:FindFirstChild("SingularityCape") then return end
+    local balls = workspace:FindFirstChild("Balls"); if not balls then return end
+    for _, ball in ipairs(balls:GetChildren()) do
+        if ball:IsA("BasePart") and ball:GetAttribute("target") == LocalPlayer.Name then
+            triggerBall(ball); break
+        end
+    end
+end
+function Triggerbot.enable(state)
+    Allusive.triggerbot.enabled = state
+    if state then
+        if not Triggerbot.conn then
+            Triggerbot.conn = RunService.Heartbeat:Connect(triggerLoop)
+        end
+    else
+        if Triggerbot.conn then Triggerbot.conn:Disconnect(); Triggerbot.conn = nil end
+        Allusive.triggerbot.isParrying = false
+        Allusive.triggerbot.parries = 0
+    end
+end
+
+-- ====================== MANUAL SPAM ======================================
+local ManualSpam = {
+    active = false, conn = nil, acc = 0,
+    gui = nil, frame = nil, button = nil, title = nil,
+}
+local function stopManualLoop()
+    if ManualSpam.conn then ManualSpam.conn:Disconnect(); ManualSpam.conn = nil end
+    ManualSpam.acc = 0
+end
+local function startManualLoop()
+    stopManualLoop()
+    ManualSpam.conn = RunService.Heartbeat:Connect(function(dt)
+        if not ManualSpam.active then stopManualLoop(); return end
+        if not Remote.isArmed() then return end
+        local char = LocalPlayer.Character
+        if not char or char.Parent ~= workspace.Alive then return end
+        ManualSpam.acc = ManualSpam.acc + (dt or 0)
+        local interval
+        if Config.ManualCPSEnabled then
+            interval = 1 / math.clamp(Config.ManualCPS or CFG.defaultRemoteCps, 1, CFG.spamHardCapCps)
+        else
+            interval = 1 / math.max(1, Config.SpamCPS or CFG.defaultSpamCps)
+        end
+        if ManualSpam.acc < interval then return end
+        ManualSpam.acc = 0
+        BallHelper.parry()
+    end)
+end
+local function destroySpamButton()
+    ManualSpam.active = false
+    stopManualLoop()
+    if ManualSpam.gui then ManualSpam.gui:Destroy() end
+    ManualSpam.gui = nil; ManualSpam.frame = nil
+    ManualSpam.button = nil; ManualSpam.title = nil
+end
+local function createSpamButton()
+    destroySpamButton()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SeraphimSpamPanel"; gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 100
+    local parented = pcall(function() gui.Parent = CoreGuiX end)
+    if not parented or not gui.Parent then
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+    ManualSpam.gui = gui
+
+    local frame = Instance.new("Frame", gui)
+    frame.Size = UDim2.new(0, 140, 0, 70)
+    frame.Position = UDim2.new(0.4, 0, 0.5, -35)
+    frame.BackgroundColor3 = Color3.fromRGB(9, 10, 15)
+    frame.BorderSizePixel = 1; frame.BorderColor3 = Color3.fromRGB(26, 29, 38)
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 4)
+    ManualSpam.frame = frame
+
+    local title = Instance.new("TextLabel", frame)
+    title.Size = UDim2.new(1, 0, 0, 16); title.Position = UDim2.new(0, 0, 0, 6)
+    title.Text = "SERAPHIM SPAM"; title.TextColor3 = Color3.fromRGB(232, 235, 242)
+    title.BackgroundTransparency = 1; title.Font = Enum.Font.GothamBold
+    title.TextSize = 11; title.TextXAlignment = Enum.TextXAlignment.Center
+    ManualSpam.title = title
+
+    local btn = Instance.new("TextButton", frame)
+    btn.Size = UDim2.new(0, 110, 0, 28); btn.Position = UDim2.new(0.5, -55, 0, 34)
+    btn.Text = "OFF"; btn.BackgroundColor3 = Color3.fromRGB(18, 21, 29)
+    btn.TextColor3 = Color3.fromRGB(232, 235, 242)
+    btn.BorderSizePixel = 1; btn.BorderColor3 = Color3.fromRGB(26, 29, 38)
+    btn.Font = Enum.Font.GothamBold; btn.TextSize = 12
+    btn.AutoButtonColor = false
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 3)
+    ManualSpam.button = btn
+
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = input.Position; startPos = frame.Position
+        end
+    end)
+    title.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UserInputServiceX.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    btn.MouseButton1Click:Connect(function()
+        if not Remote.isArmed() then log("Spam: parry once first"); return end
+        ManualSpam.active = not ManualSpam.active
+        btn.Text = ManualSpam.active and "ON" or "OFF"
+        if ManualSpam.active then
+            startManualLoop()
+        else
+            stopManualLoop()
+        end
+    end)
+end
+
+-- ====================== AUTO SPAM ========================================
+local AutoSpam = { conn = nil, threshold = CFG.defaultParryThreshold }
+function AutoSpam.enable(state)
+    if AutoSpam.conn then AutoSpam.conn:Disconnect(); AutoSpam.conn = nil end
+    if not state then return end
+    AutoSpam.conn = RunService.PreSimulation:Connect(function()
+        if not Remote.isArmed() then return end
+        local char = LocalPlayer.Character
+        if not char or char.Parent ~= workspace.Alive then return end
+        if Allusive.state.slashesoffuryActive then return end
+        local ball = BallHelper.get_ball(); if not ball then return end
+        local z = ball:FindFirstChild("zoomies"); if not z then return end
+        local ping = PingCache.get()
+        local pingT = math.clamp(ping / 10, 1, 16)
+        local speed = z.VectorVelocity.Magnitude
+        local distance = LocalPlayer:DistanceFromCharacter(ball.Position)
+        local target = ball:GetAttribute("target")
+        local maxDist = pingT + math.min(speed / 6, 255)
+        if distance > maxDist then return end
+        if target == LocalPlayer.Name and distance > 30 then return end
+        if distance <= maxDist and Parry.count > AutoSpam.threshold then
+            BallHelper.parry()
+        end
+    end)
+end
+
+-- ====================== MACROS ===========================================
+local Macro = {
+    enabled = false, macro1 = false, macro2 = false,
+    cps = CFG.defaultTurboCps, m1Cps = CFG.defaultMacroCps, m2Cps = CFG.defaultMacroCps,
+    conn = nil, acc = 0, a1 = 0, a2 = 0,
+}
+local function macroTick(dt)
+    if not Remote.isArmed() then return end
+    dt = dt or 0.016
+    if Macro.macro1 then
+        Macro.a1 = Macro.a1 + dt
+        local iv = 1 / math.min(math.max(Macro.m1Cps, 1), 200)
+        if Macro.a1 >= iv then Macro.a1 = 0; BallHelper.parry() end
+    end
+    if Macro.macro2 then
+        Macro.a2 = Macro.a2 + dt
+        local iv = 1 / math.min(math.max(Macro.m2Cps, 1), 200)
+        if Macro.a2 >= iv then Macro.a2 = 0; BallHelper.parry() end
+    end
+    if Macro.enabled then
+        Macro.acc = Macro.acc + dt
+        local iv = 1 / math.min(math.max(Macro.cps, 1), 200)
+        if Macro.acc >= iv then Macro.acc = 0; BallHelper.parry() end
+    end
+end
+local function startMacroLoop()
+    if Macro.conn then return end
+    Macro.conn = RunService.Heartbeat:Connect(macroTick)
+end
+
+-- ====================== ERROR BUDGET =====================================
+task.spawn(function()
+    while true do
+        task.wait(1.0)
+        if Config.Enabled then
+            local errs = Stats2.errorRate() * CFG.errorWindowSec
+            if errs >= CFG.errorBudget then
+                warn(LOG_PREFIX, "error budget exceeded — disabling autoparry")
+                Config.Enabled = false
+                AutoParry.stop()
+                pcall(function()
+                    if Window and Window.Notify then
+                        Window:Notify({Title = "Auto Parry", Text = "Disabled: too many errors", Duration = 4})
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+-- ====================== PLAYER MODS ======================================
+local PlayerMods = {
+    fovEnabled = false, fov = 70,
+    wsEnabled = false, ws = 16,
+    jpEnabled = false, jp = 50,
+    ijEnabled = false, ijConn = nil, reapplyConn = nil,
+}
+local function applyPlayerMods()
+    safe(function()
+        workspace.CurrentCamera.FieldOfView = PlayerMods.fovEnabled and PlayerMods.fov or 70
+    end)
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if hum then
+        if PlayerMods.wsEnabled then hum.WalkSpeed = PlayerMods.ws end
+        if PlayerMods.jpEnabled then hum.JumpPower = PlayerMods.jp end
+    end
+end
+local function startInfiniteJump()
+    if PlayerMods.ijConn then PlayerMods.ijConn:Disconnect() end
+    PlayerMods.ijConn = UserInputServiceX.JumpRequest:Connect(function()
+        if not PlayerMods.ijEnabled then return end
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end)
+end
+local function startModReapply()
+    if PlayerMods.reapplyConn then PlayerMods.reapplyConn:Disconnect() end
+    PlayerMods.reapplyConn = LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(0.5); applyPlayerMods()
+    end)
+end
+
+-- ====================== NO RENDER ========================================
+local NoRender = { active = false, conn = nil }
+local function noRenderEnable(state)
+    NoRender.active = state
+    safe(function() LocalPlayer.PlayerScripts.EffectScripts.ClientFX.Disabled = state end)
+    if state then
+        if not NoRender.conn then
+            NoRender.conn = Runtime.ChildAdded:Connect(function(v)
+                Debris:AddItem(v, 0)
+            end)
+        end
+    else
+        if NoRender.conn then NoRender.conn:Disconnect(); NoRender.conn = nil end
+    end
+end
+
+-- ====================== CURVE HOTKEYS ====================================
+local CURVE_HOTKEYS = {
+    {key = Enum.KeyCode.One,   name = "camera"},
+    {key = Enum.KeyCode.Two,   name = "random"},
+    {key = Enum.KeyCode.Three, name = "accelerated"},
+    {key = Enum.KeyCode.Four,  name = "backwards"},
+    {key = Enum.KeyCode.Five,  name = "slow"},
+    {key = Enum.KeyCode.Six,   name = "high"},
+}
+local curveHotkeysOn = false
+UserInputServiceX.InputBegan:Connect(function(input, processed)
+    if processed or not curveHotkeysOn then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    for _, c in ipairs(CURVE_HOTKEYS) do
+        if input.KeyCode == c.key then
+            Config.CurveMode = c.name
+            pcall(function()
+                if Window and Window.Notify then
+                    Window:Notify({Title = "AutoCurve", Text = c.name, Duration = 2})
+                end
+            end)
+            break
+        end
+    end
+end)
+
+--[[
+    ⚠️  DO NOT RUN YET — paste Chunk 4 immediately below this line.
+    Chunk 3 ends here. Chunk 4 begins with "Immortal module".
+]]-- =========================================================================
+-- IMMORTAL MODULE v4.1 (high-frequency, anti-reconciliation)
+--   Two engines, mutually exclusive (One Immortal):
+--     * EclipseImmortal — __index hook spoofs HRP/Head CFrame reads
+--     * Semi Immortal  — physical CFrame desync on RenderStepped
+--   Smart Desync v3 classifies inbound balls and only spoofs when threatened.
+-- =========================================================================
+
+local Immortal = {}
+Immortal.__index = Immortal
+
+Immortal.immortalEnabled = false
+Immortal.desyncActive = false
+Immortal.spoofing = false
+Immortal.hookInstalled = false
+Immortal.pose = { cframe = nil, velocity = nil }
+Immortal.spoofCount = 0
+Immortal.beatsThisFrame = 0
+Immortal.frameBudgetMs = 4
+Immortal.eclipseConn = nil
+
+local IMMORTAL_CFG_FILE = "Seraphim/immortal.json"
+Immortal.cfg = {
+    -- EclipseImmortal
+    angle = 72, height = 15, depth = -8, squareRadius = 10,
+    speedBypass = true,
+    -- Semi Immortal — HYPER TUNED
+    oscRadius = 55, oscHeight = 15, velocitySpike = 6000,
+    renderSteppedMode = true,
+    beatsPerFrame = 2,
+    spoofPhaseJitter = true,
+    velocityScale = true,
+    networkClaimStride = 1,
+    physicsPause = true,
+    microJitter = true,
+    predictiveVelocity = true,
+    -- Smart Desync
+    smart = false,
+    sweepRange = 300, slowCap = 60, fastFloor = 150, lead = 6,
+    holdSlow = 8, holdMed = 5, holdFast = 4,
+    turnThreshold = 20, curveBoost = 3, missBoost = 4,
+}
+local cfg = Immortal.cfg
+local CLASS_PROFILE = {
+    SLOW   = { rng = 1.8, lead = 2.0 },
+    MEDIUM = { rng = 1.0, lead = 1.0 },
+    FAST   = { rng = 0.8, lead = 1.5 },
+    CURVE  = { rng = 1.4 },
+}
+
+local function loadImmortalCfg()
+    safe(function()
+        if isfile and isfile(IMMORTAL_CFG_FILE) then
+            local d = HttpService:JSONDecode(readfile(IMMORTAL_CFG_FILE))
+            for k, v in pairs(d) do
+                if cfg[k] ~= nil and type(v) == type(cfg[k]) then cfg[k] = v end
+            end
+            log("immortal config loaded")
+        end
+    end)
+end
+local function saveImmortalCfg()
+    safe(function()
+        if writefile then
+            local ok = pcall(function() if makefolder and not isfolder("Seraphim") then makefolder("Seraphim") end end)
+            writefile(IMMORTAL_CFG_FILE, HttpService:JSONEncode(cfg))
+        end
+    end)
+end
+loadImmortalCfg()
+
+-- ====================== PHASE JITTER =====================================
+local phaseRng = Random.new(math.floor(os.clock() * 1e6) % 2^31)
+local function jitteredPhase(base)
+    if not cfg.spoofPhaseJitter then return base end
+    local j = phaseRng:NextNumber(-0.08, 0.08)
+    return base * (1 + j)
+end
+
+-- ====================== ONE IMMORTAL =====================================
+function Immortal.enableEclipseImmortal(state)
+    if state and Immortal.desyncActive then
+        Immortal.stopDesync()
+        pcall(function()
+            if Window and Window.Notify then
+                Window:Notify({Title = "Immortal", Text = "Semi Immortal auto-stopped — one at a time", Duration = 3})
+            end
+        end)
+    end
+    Immortal.immortalEnabled = state
+    if state then Immortal.installHook() end
+end
+
+function Immortal.enableDesync(state)
+    if state and Immortal.immortalEnabled then
+        Immortal.enableEclipseImmortal(false)
+        if Immortal.ui and Immortal.ui.eclipseToggle then
+            pcall(function() Immortal.ui.eclipseToggle:SetValue(false) end)
+        end
+        pcall(function()
+            if Window and Window.Notify then
+                Window:Notify({Title = "Immortal", Text = "EclipseImmortal auto-disabled — one at a time", Duration = 3})
+            end
+        end)
+    end
+    Immortal.desyncActive = state
+    if state then Immortal.startDesyncLoops()
+    else Immortal.stopDesync() end
+end
+
+-- ====================== ECLIPSE IMMORTAL (hook) ==========================
+function Immortal.installHook()
+    if Immortal.hookInstalled then return end
+    local hookFn = hookmetamethod
+    if not hookFn then return end
+    local ok = pcall(function()
+        local oldIndex
+        oldIndex = hookFn(game, "__index", newcclosure(function(self, key)
+            if Immortal.immortalEnabled and not checkcaller() then
+                local char = LocalPlayer.Character
+                if char then
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    local head = char:FindFirstChild("Head")
+                    if key == "CFrame" then
+                        if self == hrp and Immortal.pose.cframe then
+                            return Immortal.pose.cframe
+                        elseif self == head and Immortal.pose.cframe and hrp then
+                            return Immortal.pose.cframe
+                                + Vector3.new(0, hrp.Size.Y / 2 + 0.5, 0)
+                        end
+                    end
+                    if (key == "AssemblyLinearVelocity" or key == "Velocity") and self == hrp then
+                        if Immortal.pose.velocity then
+                            return Immortal.pose.velocity
+                        end
+                    end
+                end
+            end
+            return oldIndex(self, key)
+        end))
+    end)
+    Immortal.hookInstalled = ok
+    if ok then log("EclipseImmortal hook installed") end
+end
+
+local function eclipseBeat()
+    if not Immortal.immortalEnabled then return end
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    Immortal.pose.cframe = hrp.CFrame
+    Immortal.pose.velocity = hrp.AssemblyLinearVelocity
+
+    local t = tick()
+    local a = t * math.pi * 2 * cfg.angle / 5
+    local cycle = math.floor(t * 29) % 2
+    local yOff = (cycle == 0) and cfg.depth or cfg.height
+    local offset = Vector3.new(
+        math.cos(a) * cfg.squareRadius,
+        yOff,
+        math.sin(a) * cfg.squareRadius
+    )
+    hrp.CFrame = Immortal.pose.cframe + offset
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    RunService.RenderStepped:Wait()
+    if hrp.Parent then
+        hrp.CFrame = Immortal.pose.cframe
+        hrp.AssemblyLinearVelocity = Immortal.pose.velocity
+    end
+end
+
+function Immortal.startEclipseImmortal()
+    if Immortal.eclipseConn then return end
+    if cfg.speedBypass then
+        pcall(function() setfflag("S2PhysicsSenderRate", "1333335") end)
+    end
+    Immortal.eclipseConn = RunService.Heartbeat:Connect(eclipseBeat)
+end
+
+function Immortal.stopEclipseImmortal()
+    if Immortal.eclipseConn then Immortal.eclipseConn:Disconnect(); Immortal.eclipseConn = nil end
+    if Immortal.pose.cframe then
+        pcall(function()
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.CFrame = Immortal.pose.cframe
+                hrp.AssemblyLinearVelocity = Immortal.pose.velocity or Vector3.zero
+            end
+        end)
+    end
+    Immortal.pose.cframe = nil
+    Immortal.pose.velocity = nil
+    Immortal.immortalEnabled = false
+end
+
+-- ====================== SEMI IMMORTAL (high-freq desync) =================
+local desyncConns = {}
+local ballMem = setmetatable({}, { __mode = "k" })
+local smartUntil = 0
+local threatNow = false
+local nearestDist = nil
+local lastClass = "-"
+
+local function desyncStop()
+    local wasSpoofing = Immortal.spoofing
+    Immortal.spoofing = false
+    Immortal.desyncActive = false
+    for _, c in ipairs(desyncConns) do pcall(function() c:Disconnect() end) end
+    desyncConns = {}
+    if wasSpoofing and Immortal.pose.cframe then
+        pcall(function()
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.CFrame = Immortal.pose.cframe
+                hrp.AssemblyLinearVelocity = Immortal.pose.velocity or Vector3.zero
+            end
+        end)
+    end
+    Immortal.pose.cframe = nil
+    Immortal.pose.velocity = nil
+    smartUntil = 0
+    threatNow = false
+    nearestDist = nil
+    ballMem = setmetatable({}, { __mode = "k" })
+    lastClass = "-"
+    Immortal.spoofCount = 0
+    Immortal.beatsThisFrame = 0
+end
+
+local function smartScan()
+    local now = os.clock()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    nearestDist = nil
+    lastClass = "-"
+    if next(ballMem) then
+        for b, m in pairs(ballMem) do
+            if now - m.t > 2 then ballMem[b] = nil end
+        end
+    end
+
+    local ballsFolder = workspace:FindFirstChild("Balls")
+    if not ballsFolder then
+        smartUntil = math.max(smartUntil, now + cfg.holdMed)
+        return
+    end
+
+    local holdBefore = smartUntil
+    local myName = LocalPlayer.Name
+
+    for _, ball in ipairs(ballsFolder:GetChildren()) do
+        if not ball:GetAttribute("realBall") then continue end
+        local part = ball:IsA("BasePart") and ball or ball.PrimaryPart
+        if not part then continue end
+
+        local offset = part.Position - hrp.Position
+        local dist = offset.Magnitude
+        if not nearestDist or dist < nearestDist then nearestDist = dist end
+
+        local vel = part.AssemblyLinearVelocity
+        local sp = vel.Magnitude
+        if sp < 1 then ballMem[ball] = nil; continue end
+
+        local cls = "MEDIUM"
+        if sp < cfg.slowCap then cls = "SLOW"
+        elseif sp > cfg.fastFloor then cls = "FAST" end
+        local prof = CLASS_PROFILE[cls]
+
+        local inbound = vel.Unit:Dot(-offset.Unit)
+
+        local curve = false
+        local curDir = vel.Unit
+        local mem = ballMem[ball]
+        if mem then
+            local dt = now - mem.t
+            if dt >= 0.03 and dt <= 1.5 then
+                local turn = math.acos(math.clamp(mem.dir:Dot(curDir), -1, 1)) / dt
+                if turn >= math.rad(cfg.turnThreshold) and dist <= cfg.sweepRange * 10 then
+                    curve = true
+                end
+            end
+        end
+        ballMem[ball] = { dir = curDir, t = now }
+
+        local clsRange = cfg.sweepRange * prof.rng * (curve and CLASS_PROFILE.CURVE.rng or 1)
+        local clsLead = cfg.lead * prof.lead
+        local clsHold = cls == "SLOW" and cfg.holdSlow
+                     or cls == "FAST" and cfg.holdFast
+                     or cfg.holdMed
+        if curve then clsHold = clsHold + cfg.curveBoost end
+        local miss = dist <= clsRange and inbound > 0
+        if miss then clsHold = clsHold + cfg.missBoost end
+
+        local trip = false
+        if dist <= clsRange then trip = true end
+        if inbound > 0.2 and dist / sp <= clsLead then trip = true end
+        if curve and dist <= cfg.sweepRange * 3 then trip = true end
+        if ball:GetAttribute("target") == myName then trip = true end
+
+        if trip then
+            smartUntil = math.max(smartUntil, now + clsHold)
+            lastClass = cls
+                .. (curve and "-CURVE" or "")
+                .. (miss and "+MISS" or "")
+        end
+    end
+    threatNow = smartUntil > holdBefore
+end
+
+local lastNetworkClaim = 0
+local function oneSpoofBeat()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local t0 = os.clock()
+    Immortal.pose.cframe = hrp.CFrame
+    Immortal.pose.velocity = hrp.AssemblyLinearVelocity
+
+    if cfg.networkClaimStride > 0
+       and (Immortal.spoofCount % cfg.networkClaimStride) == 0 then
+        pcall(function() hrp:SetNetworkOwner(LocalPlayer) end)
+    end
+
+    local t = tick()
+    local phase = jitteredPhase(t)
+    local hOsc = math.sin(phase * 60) * cfg.oscRadius
+    local vOsc = math.sin(phase * 25) * cfg.oscHeight
+
+    local microX, microY, microZ = 0, 0, 0
+    if cfg.microJitter then
+        microX = phaseRng:NextNumber(-0.5, 0.5)
+        microY = phaseRng:NextNumber(-0.2, 0.2)
+        microZ = phaseRng:NextNumber(-0.5, 0.5)
+    end
+
+    local offset = Vector3.new(hOsc + microX, vOsc + microY, microZ)
+    local rotAmp = 20
+    local spoofed = Immortal.pose.cframe
+        * CFrame.new(offset)
+        * CFrame.Angles(
+            math.rad(phaseRng:NextNumber(-rotAmp, rotAmp)),
+            math.rad(phaseRng:NextNumber(-rotAmp, rotAmp)),
+            math.rad(phaseRng:NextNumber(-rotAmp, rotAmp)))
+
+    Immortal.spoofing = true
+    Immortal.spoofCount = Immortal.spoofCount + 1
+    hrp.CFrame = spoofed
+
+    if cfg.physicsPause and cfg.predictiveVelocity then
+        local look = hrp.CFrame.LookVector
+        local nudge = (cfg.velocityScale and 1 + cfg.velocitySpike / 10000 or 1)
+        hrp.AssemblyLinearVelocity = look * (2 * nudge)
+    elseif cfg.physicsPause then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    elseif cfg.velocityScale then
+        local v = Immortal.pose.velocity
+        local mag = v.Magnitude
+        local scaled = (mag > 0) and (v / mag) * cfg.velocitySpike or Vector3.zero
+        hrp.AssemblyLinearVelocity = scaled
+    else
+        hrp.AssemblyLinearVelocity = Immortal.pose.velocity
+            + Vector3.new(
+                math.cos(t * 8) * cfg.velocitySpike,
+                math.cos(t * 8) * cfg.velocitySpike,
+                0)
+    end
+
+    task.wait()
+
+    if hrp.Parent then
+        hrp.CFrame = Immortal.pose.cframe
+        hrp.AssemblyLinearVelocity = Immortal.pose.velocity or Vector3.zero
+    end
+    Immortal.spoofing = false
+
+    local elapsed = (os.clock() - t0) * 1000
+    if elapsed > Immortal.frameBudgetMs then
+        Immortal.beatsThisFrame = 0
+    end
+end
+
+function Immortal.startDesyncLoops()
+    if #desyncConns > 0 then return end
+
+    desyncConns[#desyncConns + 1] = RunService.Stepped:Connect(function()
+        if not Immortal.desyncActive then return end
+        if cfg.networkClaimStride > 0 then return end
+        local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then pcall(function() hrp:SetNetworkOwner(LocalPlayer) end) end
+    end)
+
+    local scanAcc = 0
+    desyncConns[#desyncConns + 1] = RunService.Heartbeat:Connect(function(dt)
+        if not Immortal.desyncActive then return end
+        if not cfg.smart then return end
+        scanAcc = scanAcc + dt
+        if scanAcc < 0.033 then return end
+        scanAcc = 0
+        smartScan()
+    end)
+
+    local beatDriver = cfg.renderSteppedMode and RunService.RenderStepped or RunService.Heartbeat
+    desyncConns[#desyncConns + 1] = beatDriver:Connect(function()
+        if not Immortal.desyncActive then
+            Immortal.spoofing = false
+            return
+        end
+
+        if cfg.smart and os.clock() >= smartUntil then
+            Immortal.spoofing = false
+            return
+        end
+
+        local beats = math.max(1, math.min(cfg.beatsPerFrame, 4))
+        Immortal.beatsThisFrame = 0
+        for _ = 1, beats do
+            if Immortal.beatsThisFrame >= beats then break end
+            Immortal.beatsThisFrame = Immortal.beatsThisFrame + 1
+            oneSpoofBeat()
+            if not Immortal.desyncActive then break end
+        end
+    end)
+
+    log("Semi Immortal active (%s, %dx/frame)",
+        cfg.renderSteppedMode and "RenderStepped" or "Heartbeat",
+        cfg.beatsPerFrame)
+end
+
+function Immortal.stopDesync()
+    desyncStop()
+    pcall(function()
+        if Window and Window.Notify then
+            Window:Notify({Title = "Immortal", Text = "Semi Immortal stopped", Duration = 3})
+        end
+    end)
+end
+
+-- ====================== CLEANUP =========================================
+local _oldUnload = getgenv().SeraphimUnload or function() end
+getgenv().SeraphimUnload = function()
+    Immortal.stopEclipseImmortal()
+    Immortal.stopDesync()
+    AutoParry.stop()
+    Triggerbot.enable(false)
+    if ManualSpam.active then ManualSpam.active = false end
+    Macro.enabled = false
+    for _, c in ipairs(BallRegistry.conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    pcall(_oldUnload)
+end
+
+LocalPlayer.OnTeleport:Connect(function()
+    pcall(getgenv().SeraphimUnload)
+end)
+
+--[[
+    ⚠️  DO NOT RUN YET — paste Chunk 5 immediately below this line.
+    Chunk 4 ends here. Chunk 5 begins with "NeverLose-styled UI".
+]]-- =========================================================================
+-- NEVERLOSE-STYLED UI (AngeliUI API-compatible)
+--   Same public methods as AngeliUI so every widget call below is identical.
+--   Visual identity mimics NeverLose: near-black bg, blue accent, thin
+--   strokes, 4px corners, watermark/indicator/logger/notifications.
+-- =========================================================================
+local AngeliUI
+do
+    local TweenService = TweenServiceX
+    local UIS = UserInputServiceX
+    local RS = RunService
+    local LP = LocalPlayer
+    local isMobile = UIS.TouchEnabled and not UIS.MouseEnabled
+
+    local HAS_CANVASGROUP = pcall(function() return Instance.new("CanvasGroup") end)
+    local HAS_UISCALE    = pcall(function() return Instance.new("UIScale") end)
+
+    local function makeTextContainer()
+        if HAS_CANVASGROUP then return Instance.new("CanvasGroup") end
+        local f = Instance.new("Frame"); f.BackgroundTransparency = 1; return f
+    end
+
+    -- NeverLose theme
+    local Theme = {
+        Background    = Color3.fromRGB(9, 10, 15),
+        Group         = Color3.fromRGB(12, 14, 20),
+        GroupStroke   = Color3.fromRGB(26, 29, 38),
+        Control       = Color3.fromRGB(18, 21, 29),
+        ControlHover  = Color3.fromRGB(24, 28, 38),
+        Divider       = Color3.fromRGB(20, 23, 31),
+        Text          = Color3.fromRGB(232, 235, 242),
+        TextDim       = Color3.fromRGB(120, 128, 145),
+        TextSoft      = Color3.fromRGB(178, 185, 200),
+        HeaderText    = Color3.fromRGB(96, 104, 120),
+        TabSelected   = Color3.fromRGB(15, 18, 26),
+        PillOff       = Color3.fromRGB(40, 45, 58),
+        KnobOff       = Color3.fromRGB(74, 87, 97),
+        PillOn        = Color3.fromRGB(61, 133, 224),
+        KnobOn        = Color3.fromRGB(255, 255, 255),
+        SliderTrack   = Color3.fromRGB(24, 28, 38),
+        SliderFill    = Color3.fromRGB(61, 133, 224),
+        Accent        = Color3.fromRGB(61, 133, 224),
+        AccentDim     = Color3.fromRGB(27, 141, 240),
+    }
+
+    local Icons = {
+        skull = {16898613777, 49, 869}, user = {16898613869, 661, 869},
+        ["eye-off"] = {16898613353, 820, 514}, list = {16898613509, 869, 808},
+        save = {16898613699, 918, 453}, ["book-open"] = {16898612819, 820, 355},
+        ["chevrons-up-down"] = {16898612819, 918, 759}, database = {16898613044, 710, 869},
+        eye = {16898613353, 820, 514},
+    }
+
+    local TF = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local TM = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    local TT = TweenInfo.new(0.22, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+    local function New(c, p, ch)
+        local i = Instance.new(c)
+        for k, v in pairs(p or {}) do if k ~= "Parent" then pcall(function() i[k] = v end) end end
+        for _, x in ipairs(ch or {}) do x.Parent = i end
+        if p and p.Parent ~= nil then i.Parent = p.Parent end
+        return i
+    end
+    local function Tw(o, i, p) TweenService:Create(o, i or TF, p):Play() end
+    local function Cn(p, r) return New("UICorner", {CornerRadius = UDim.new(0, r), Parent = p}) end
+    local function St(p, c, t) return New("UIStroke", {Color = c or Theme.GroupStroke, Transparency = t or 0, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = p}) end
+    local function Pd(p, a, b, c, d) return New("UIPadding", {PaddingTop = UDim.new(0, a or 0), PaddingBottom = UDim.new(0, b or 0), PaddingLeft = UDim.new(0, c or 0), PaddingRight = UDim.new(0, d or 0), Parent = p}) end
+    local function Rnd(n, d) local m = 10 ^ (d or 0); return math.floor(n * m + 0.5) / m end
+
+    local function MI(p, ic, s, c)
+        local a = ic and Icons[ic]
+        if a then
+            return New("ImageLabel", {Size = UDim2.fromOffset(s, s), BackgroundTransparency = 1, Image = "rbxassetid://" .. a[1], ImageRectSize = Vector2.new(48, 48), ImageRectOffset = Vector2.new(a[2], a[3]), ImageColor3 = c, ScaleType = Enum.ScaleType.Stretch, Parent = p})
+        end
+        return New("Frame", {Size = UDim2.fromOffset(4, 4), BackgroundColor3 = c, BorderSizePixel = 0, Parent = p})
+    end
+
+    local Lib = {}
+
+    -- ====================== WATERMARK ====================================
+    local function MakeWatermark(parent)
+        local gui = New("ScreenGui", { Name = "SeraphimNL_Watermark", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 998, Parent = parent })
+        local frame = New("Frame", {
+            Name = "Root", AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -14, 0, 14),
+            Size = UDim2.fromOffset(260, 26),
+            BackgroundColor3 = Theme.Group, BackgroundTransparency = 0.05,
+            BorderSizePixel = 0, Parent = gui,
+        })
+        Cn(frame, 4); St(frame, Theme.Accent, 0.55)
+        New("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            HorizontalAlignment = Enum.HorizontalAlignment.Right,
+            VerticalAlignment = Enum.VerticalAlignment.Center,
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Padding = UDim.new(0, 6), Parent = frame,
+        })
+        Pd(frame, 0, 0, 8, 8)
+        New("TextLabel", {
+            LayoutOrder = 99, Size = UDim2.fromOffset(84, 26),
+            BackgroundTransparency = 1, Text = "SERAPHIM",
+            Font = Enum.Font.GothamBold, TextSize = 11,
+            TextColor3 = Theme.Accent, TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = frame,
+        })
+        local Wm = { frame = frame, gui = gui, order = 0 }
+        function Wm:AddBlock(icon, text)
+            self.order += 1
+            local block = New("Frame", {
+                LayoutOrder = self.order, Size = UDim2.fromOffset(56, 22),
+                BackgroundColor3 = Theme.Control, BackgroundTransparency = 0.4,
+                BorderSizePixel = 0, Parent = frame,
+            })
+            Cn(block, 3); St(block, Theme.GroupStroke, 0.5)
+            local ic = MI(block, icon or "list", 11, Theme.Accent)
+            ic.AnchorPoint = Vector2.new(0, 0.5); ic.Position = UDim2.new(0, 5, 0.5, 0)
+            local lbl = New("TextLabel", {
+                Position = UDim2.new(0, 20, 0, 0), Size = UDim2.new(1, -22, 1, 0),
+                BackgroundTransparency = 1, Text = text or "—",
+                Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = Theme.Text,
+                TextXAlignment = Enum.TextXAlignment.Left, Parent = block,
+            })
+            local function setText(t)
+                lbl.Text = t
+                local w = math.clamp(#tostring(t) * 6 + 28, 46, 120)
+                Tw(block, TF, { Size = UDim2.fromOffset(w, 22) })
+            end
+            return {
+                SetText = setText,
+                SetColor = function(c) ic.ImageColor3 = c end,
+                Input = function(cb)
+                    local btn = New("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", Parent = block })
+                    btn.MouseButton1Click:Connect(cb)
+                end,
+            }
+        end
+        function Wm:SetVisible(v) frame.Visible = v end
+        -- Drag
+        local dragging, dragStart, startPos
+        frame.InputBegan:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; dragStart = inp.Position; startPos = frame.Position
+            end
+        end)
+        UIS.InputChanged:Connect(function(inp)
+            if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+                local d = inp.Position - dragStart
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+        UIS.InputEnded:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        return Wm
+    end
+
+    -- ====================== INDICATOR ====================================
+    local function MakeIndicator(parent)
+        local gui = New("ScreenGui", { Name = "SeraphimNL_Indicator", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 998, Parent = parent })
+        local frame = New("Frame", {
+            AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -14, 1, -14),
+            Size = UDim2.fromOffset(150, 26), BackgroundColor3 = Theme.Group,
+            BackgroundTransparency = 0.05, BorderSizePixel = 0, Visible = false, Parent = gui,
+        })
+        Cn(frame, 4); St(frame, Theme.Accent, 0.55)
+        local ic = MI(frame, "skull", 12, Theme.Accent)
+        ic.AnchorPoint = Vector2.new(0, 0.5); ic.Position = UDim2.new(0, 8, 0.5, 0)
+        local dot = New("Frame", {
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+            Size = UDim2.fromOffset(8, 8),
+            BackgroundColor3 = Color3.fromRGB(120, 255, 120),
+            BorderSizePixel = 0, Parent = frame,
+        })
+        Cn(dot, 4)
+        local lbl = New("TextLabel", {
+            Position = UDim2.new(0, 26, 0, 0), Size = UDim2.new(1, -42, 1, 0),
+            BackgroundTransparency = 1, Text = "IND",
+            Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left, Parent = frame,
+        })
+        local Ind = { frame = frame }
+        function Ind:SetText(t) lbl.Text = tostring(t) end
+        function Ind:SetColor(c)
+            if typeof(c) == "string" then
+                local colors = { Red = Color3.fromRGB(255, 90, 90), Green = Color3.fromRGB(120, 255, 120), Blue = Theme.Accent, White = Theme.Text }
+                c = colors[c] or Theme.Accent
+            end
+            lbl.TextColor3 = c; dot.BackgroundColor3 = c
+        end
+        function Ind:SetRender(v) frame.Visible = v end
+        return Ind
+    end
+
+    -- ====================== LOGGER =======================================
+    local function MakeLogger(parent)
+        local gui = New("ScreenGui", { Name = "SeraphimNL_Logger", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 998, Parent = parent })
+        local frame = New("Frame", {
+            AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 14, 1, -14),
+            Size = UDim2.fromOffset(300, 170), BackgroundColor3 = Theme.Group,
+            BackgroundTransparency = 0.08, BorderSizePixel = 0, Parent = gui,
+        })
+        Cn(frame, 4); St(frame, Theme.GroupStroke, 0.4)
+        New("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1,
+            Text = "  LOGGER", Font = Enum.Font.GothamBold, TextSize = 10,
+            TextColor3 = Theme.HeaderText, TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = frame,
+        })
+        New("Frame", {
+            Position = UDim2.new(0, 0, 0, 22), Size = UDim2.new(1, 0, 0, 1),
+            BackgroundColor3 = Theme.Divider, BorderSizePixel = 0, Parent = frame,
+        })
+        local scroll = New("ScrollingFrame", {
+            Position = UDim2.new(0, 0, 0, 23), Size = UDim2.new(1, 0, 1, -23),
+            BackgroundTransparency = 1, ScrollBarThickness = 2,
+            ScrollBarImageColor3 = Theme.Accent,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            BorderSizePixel = 0, Parent = frame,
+        })
+        Pd(scroll, 8, 8, 8, 8)
+        New("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = scroll })
+        local order = 0
+        local Lg = {}
+        function Lg:New(icon, text, duration)
+            order += 1
+            local row = New("Frame", {
+                LayoutOrder = order, Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = scroll,
+            })
+            local ic = MI(row, icon or "list", 10, Theme.Accent)
+            ic.Position = UDim2.new(0, 0, 0, 3)
+            local time = os.date("%H:%M:%S")
+            New("TextLabel", {
+                Position = UDim2.new(0, 18, 0, 0), Size = UDim2.new(1, -18, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+                Text = string.format("[%s] %s", time, tostring(text)),
+                Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = Theme.TextSoft,
+                TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Parent = row,
+            })
+            task.delay(duration or 8, function()
+                if row and row.Parent then
+                    Tw(row, TM, { BackgroundTransparency = 1 })
+                    task.delay(0.3, function() if row and row.Parent then row:Destroy() end end)
+                end
+            end)
+        end
+        return Lg
+    end
+
+    -- ====================== NOTIFICATIONS ================================
+    local function MakeNotifications(parent)
+        local gui = New("ScreenGui", { Name = "SeraphimNL_Notifications", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999, Parent = parent })
+        local holder = New("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 14),
+            Size = UDim2.fromOffset(320, 400), BackgroundTransparency = 1, Parent = gui,
+        })
+        New("UIListLayout", {
+            Padding = UDim.new(0, 6), HorizontalAlignment = Enum.HorizontalAlignment.Center,
+            SortOrder = Enum.SortOrder.LayoutOrder, Parent = holder,
+        })
+        local order = 0
+        local Nt = {}
+        function Nt.new(cfg)
+            cfg = cfg or {}
+            order += 1
+            local card = New("Frame", {
+                LayoutOrder = order, Size = UDim2.fromOffset(320, 0),
+                AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Theme.Group,
+                BackgroundTransparency = 0.05, BorderSizePixel = 0, Parent = holder,
+            })
+            Cn(card, 4); St(card, Theme.Accent, 0.5)
+            local strip = New("Frame", {
+                Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = Theme.Accent,
+                BorderSizePixel = 0, Parent = card,
+            })
+            Cn(strip, 4)
+            Pd(card, 10, 10, 14, 12)
+            New("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder, Parent = card })
+            New("TextLabel", {
+                LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 16),
+                BackgroundTransparency = 1, Text = cfg.Title or "Seraphim",
+                Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text,
+                TextXAlignment = Enum.TextXAlignment.Left, Parent = card,
+            })
+            New("TextLabel", {
+                LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+                Text = cfg.Content or "", Font = Enum.Font.Gotham,
+                TextSize = 11, TextColor3 = Theme.TextSoft,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextWrapped = true, Parent = card,
+            })
+            task.delay(cfg.Duration or 3, function()
+                if card and card.Parent then
+                    Tw(card, TM, { BackgroundTransparency = 1 })
+                    task.delay(0.25, function() if card and card.Parent then card:Destroy() end end)
+                end
+            end)
+        end
+        return Nt
+    end
+
+    -- ====================== WINDOW =======================================
+    function Lib:CreateWindow(o)
+        o = o or {}
+        local title = o.Title or "Seraphim"
+        local size
+        if isMobile then
+            local vp = workspace.CurrentCamera.ViewportSize
+            size = UDim2.fromOffset(math.floor(vp.X * 0.95), math.floor(vp.Y * 0.92))
+        else
+            size = UDim2.fromOffset(680, 460)
+        end
+
+        local gp
+        pcall(function() if gethui then gp = gethui() end end)
+        if not gp then
+            local ok, c = pcall(function() return game:GetService("CoreGui") end)
+            if ok and c then
+                local ok2 = pcall(function() local t = Instance.new("Folder"); t.Parent = c; t:Destroy() end)
+                if ok2 then gp = c end
+            end
+        end
+        if not gp then gp = LP:WaitForChild("PlayerGui") end
+        local old = gp:FindFirstChild("AngeliUI"); if old then old:Destroy() end
+        local oldNL = gp:FindFirstChild("SeraphimNL_Watermark"); if oldNL then oldNL:Destroy() end
+        local oldNI = gp:FindFirstChild("SeraphimNL_Indicator"); if oldNI then oldNI:Destroy() end
+        local oldNLg = gp:FindFirstChild("SeraphimNL_Logger"); if oldNLg then oldNLg:Destroy() end
+        local oldNN = gp:FindFirstChild("SeraphimNL_Notifications"); if oldNN then oldNN:Destroy() end
+
+        local Gui = New("ScreenGui", {Name = "AngeliUI", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = gp})
+
+        local Wm = MakeWatermark(gp)
+        local Ind = MakeIndicator(gp)
+        local Lg = MakeLogger(gp)
+        local Nt = MakeNotifications(gp)
+
+        local mainPosY = isMobile and 0.60 or 0.5
+        local Main = makeTextContainer()
+        Main.Name = "Main"
+        Main.AnchorPoint = Vector2.new(0.5, 0.5)
+        Main.Position = UDim2.fromScale(0.5, mainPosY)
+        Main.Size = size
+        Main.BackgroundColor3 = Theme.Background
+        Main.BorderSizePixel = 0
+        if HAS_CANVASGROUP then Main.GroupTransparency = 1 end
+        Main.Parent = Gui
+        Cn(Main, 6); St(Main, Theme.GroupStroke, 0.35)
+
+        local uiScale
+        if HAS_UISCALE then
+            uiScale = New("UIScale", {Scale = isMobile and 0.85 or 0.96, Parent = Main})
+        end
+
+        local Header = New("Frame", {Name = "Header", Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1, ZIndex = 5, Parent = Main})
+        New("TextLabel", {
+            Name = "Title", Position = UDim2.new(0, 16, 0, 0),
+            Size = UDim2.new(1, -70, 1, 0), BackgroundTransparency = 1,
+            Text = title, Font = Enum.Font.GothamBold, TextSize = 15,
+            TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left,
+            ZIndex = 6, Parent = Header,
+        })
+        New("Frame", {Position = UDim2.new(0, 0, 0, 42), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Theme.Divider, BorderSizePixel = 0, ZIndex = 5, Parent = Main})
+        New("Frame", {Position = UDim2.new(0, 160, 0, 42), Size = UDim2.new(0, 1, 1, -42), BackgroundColor3 = Theme.Divider, BorderSizePixel = 0, ZIndex = 5, Parent = Main})
+
+        do
+            local dg = false; local dgs, sp; local sx, sy = 0.5, mainPosY; local tx, ty, dx, dy
+            Header.InputBegan:Connect(function(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                    dg = true; dgs = inp.Position; sp = Main.Position
+                    sx, sy = sp.X.Scale, sp.Y.Scale
+                    tx, ty = sp.X.Offset, sp.Y.Offset; dx, dy = tx, ty
+                end
+            end)
+            UIS.InputChanged:Connect(function(inp)
+                if dg and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+                    local d = inp.Position - dgs
+                    tx = sp.X.Offset + d.X; ty = sp.Y.Offset + d.Y
+                end
+            end)
+            UIS.InputEnded:Connect(function(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then dg = false end
+            end)
+            RS.RenderStepped:Connect(function(dt)
+                if dx == nil then return end
+                local ddx = tx - dx; local ddy = ty - dy
+                if not dg and math.abs(ddx) < 0.5 and math.abs(ddy) < 0.5 then
+                    Main.Position = UDim2.new(sx, tx, sy, ty); dx = nil; return
+                end
+                local s = math.min(1, dt * 14)
+                dx += ddx * s; dy += ddy * s
+                Main.Position = UDim2.new(sx, dx, sy, dy)
+            end)
+        end
+
+        local sidebarW = isMobile and 120 or 160
+        local Sidebar = New("ScrollingFrame", {Name = "Sidebar", Position = UDim2.new(0, 0, 0, 43), Size = UDim2.new(0, sidebarW, 1, -43), BackgroundTransparency = 1, ScrollBarThickness = 0, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(0, 0, 0, 0), ScrollingDirection = Enum.ScrollingDirection.Y, BorderSizePixel = 0, ZIndex = 5, Parent = Main})
+        Pd(Sidebar, 6, 6, 6, 6)
+        New("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder, Parent = Sidebar})
+
+        local Content = New("Frame", {Name = "Content", Position = UDim2.new(0, sidebarW + 1, 0, 43), Size = UDim2.new(1, -(sidebarW + 1), 1, -43), BackgroundTransparency = 1, ZIndex = 5, Parent = Main})
+        Pd(Content, 8, 8, 8, 8)
+
+        local Window = {}
+        local so = 0; local ss = {}; local tabs = {}; local sms = {}
+        local ct = nil; local uv = false
+        local tk = Enum.KeyCode.LeftControl
+        if o.ToggleKey and Enum.KeyCode[o.ToggleKey] then tk = Enum.KeyCode[o.ToggleKey] end
+
+        function Window:SetMenuKey(newKey) tk = newKey end
+
+        RS.Heartbeat:Connect(function(dt)
+            local s = math.min(1, dt * 12)
+            for sl in pairs(sms) do
+                local df = sl.Target - sl.Display
+                if math.abs(df) < 0.0005 then
+                    sl.Display = sl.Target; sl.Render()
+                    if not sl.Dragging then sms[sl] = nil end
+                else
+                    sl.Display = sl.Display + df * s; sl.Render()
+                end
+            end
+        end)
+
+        local function setV(v)
+            uv = v
+            Main.Visible = v
+            if HAS_CANVASGROUP then Tw(Main, TM, {GroupTransparency = v and 0 or 1}) end
+            if HAS_UISCALE and uiScale then
+                Tw(uiScale, TM, {Scale = v and (isMobile and 0.85 or 1) or (isMobile and 0.8 or 0.96)})
+            end
+        end
+
+        function Window:Notify(n)
+            n = n or {}
+            Nt.new({Title = n.Title or "Seraphim", Content = n.Text or "", Duration = n.Duration or 3})
+        end
+        function Window:Logger(icon, text, duration) Lg:New(icon or "list", text or "", duration or 8) end
+        function Window:Watermark() return Wm end
+        function Window:Indicator() return Ind end
+
+        -- ====================== WIDGETS ==================================
+        local function BT(p, o, op)
+            local st = op.Default == true
+            local rw = New("Frame", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Parent = p})
+            local cl = New("TextButton", {Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = rw})
+            New("TextLabel", {Size = UDim2.new(1, -50, 1, 0), BackgroundTransparency = 1, Text = op.Name, Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = cl})
+            local pl = New("Frame", {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(30, 16), BackgroundColor3 = st and Theme.PillOn or Theme.PillOff, BorderSizePixel = 0, Parent = cl})
+            Cn(pl, 8)
+            local kn = New("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = st and UDim2.new(1, -8, 0.5, 0) or UDim2.new(0, 8, 0.5, 0), Size = UDim2.fromOffset(12, 12), BackgroundColor3 = st and Theme.KnobOn or Theme.KnobOff, BorderSizePixel = 0, Parent = pl})
+            Cn(kn, 6)
+            local e = {}
+            local function ap(f)
+                Tw(pl, TM, {BackgroundColor3 = st and Theme.PillOn or Theme.PillOff})
+                Tw(kn, TT, {Position = st and UDim2.new(1, -8, 0.5, 0) or UDim2.new(0, 8, 0.5, 0), BackgroundColor3 = st and Theme.KnobOn or Theme.KnobOff})
+                if f and op.Callback then task.spawn(op.Callback, st) end
+            end
+            function e:Get() return st end
+            function e:Set(v, f) st = v == true; ap(f ~= false) end
+            function e:SetValue(v) e:Set(v, false) end
+            cl.MouseButton1Click:Connect(function() e:Set(not st) end)
+            return e
+        end
+
+        local function BSl(p, o, op)
+            local mn = op.Min or 0; local mx = op.Max or 100; local dc = op.Decimals or 0
+            local vl = math.clamp(Rnd(op.Default or mn, dc), mn, mx)
+            local sa = (vl - mn) / (mx - mn)
+            local bx = New("Frame", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 42), BackgroundTransparency = 1, Parent = p})
+            New("TextLabel", {Size = UDim2.new(1, -40, 0, 15), BackgroundTransparency = 1, Text = op.Name, Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = Theme.TextSoft, TextXAlignment = Enum.TextXAlignment.Left, Parent = bx})
+            local vll = New("TextLabel", {AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 0, 0, 14), AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1, Text = tostring(vl), Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Theme.Accent, TextXAlignment = Enum.TextXAlignment.Right, Parent = bx})
+            local hb2 = New("TextButton", {AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, -2), Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = bx})
+            local tr = New("Frame", {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0, 5), BackgroundColor3 = Theme.SliderTrack, BorderSizePixel = 0, Parent = hb2})
+            Cn(tr, 3)
+            local fl = New("Frame", {Size = UDim2.new(sa, 0, 1, 0), BackgroundColor3 = Theme.SliderFill, BorderSizePixel = 0, Parent = tr})
+            Cn(fl, 3)
+            local kn = New("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(sa, 0, 0.5, 0), Size = UDim2.fromOffset(12, 12), BackgroundColor3 = Theme.SliderFill, BorderSizePixel = 0, Parent = tr})
+            Cn(kn, 6)
+            local sl = {Display = sa, Target = sa, Dragging = false, Fire = false, LastValue = vl}
+            function sl.Render()
+                local a = sl.Display
+                fl.Size = UDim2.new(a, 0, 1, 0); kn.Position = UDim2.new(a, 0, 0.5, 0)
+                local nv = Rnd(mn + (mx - mn) * a, dc)
+                if nv ~= sl.LastValue then
+                    sl.LastValue = nv; vl = nv; vll.Text = tostring(nv)
+                    if sl.Fire and op.Callback then task.spawn(op.Callback, nv) end
+                end
+            end
+            local function ks(px) Tw(kn, TF, {Size = UDim2.fromOffset(px, px)}) end
+            local function stx(x)
+                local r = math.clamp((x - tr.AbsolutePosition.X) / math.max(tr.AbsoluteSize.X, 1), 0, 1)
+                local sn = Rnd(mn + (mx - mn) * r, dc)
+                sl.Target = (sn - mn) / (mx - mn); sms[sl] = true
+            end
+            local function sd(inp)
+                if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                    sl.Dragging = true; sl.Fire = true; ks(15); stx(inp.Position.X)
+                end
+            end
+            hb2.InputBegan:Connect(sd); kn.InputBegan:Connect(sd); tr.InputBegan:Connect(sd)
+            UIS.InputChanged:Connect(function(inp)
+                if sl.Dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then stx(inp.Position.X) end
+            end)
+            UIS.InputEnded:Connect(function(inp)
+                if sl.Dragging and (inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch) then
+                    sl.Dragging = false; ks(12)
+                end
+            end)
+            return {Get = function() return vl end, Set = function(_, v)
+                local sn = math.clamp(Rnd(v, dc), mn, mx)
+                sl.Target = (sn - mn) / (mx - mn); sl.Fire = true; sms[sl] = true
+            end}
+        end
+
+        local function BD(p, o, op)
+            local opts = op.Options or {}
+            local vl = op.Default or opts[1]
+            local HH = 26; local RH = 23
+            local bx = New("Frame", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = p})
+            New("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = bx})
+            New("TextLabel", {LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = op.Name, Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = Theme.TextSoft, TextXAlignment = Enum.TextXAlignment.Left, Parent = bx})
+            local hd = New("Frame", {LayoutOrder = 2, Size = UDim2.new(1, 0, 0, HH), BackgroundColor3 = Theme.Control, ClipsDescendants = true, BorderSizePixel = 0, Parent = bx})
+            Cn(hd, 3); St(hd, Theme.GroupStroke, 0.5)
+            local hr = New("TextButton", {Size = UDim2.new(1, 0, 0, HH), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = hd})
+            local vt = New("TextLabel", {Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(1, -36, 1, 0), BackgroundTransparency = 1, Text = tostring(vl), Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.TextSoft, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = hr})
+            local cv = MI(hr, "chevrons-up-down", 14, Theme.TextDim)
+            cv.AnchorPoint = Vector2.new(1, 0.5); cv.Position = UDim2.new(1, -8, 0.5, 0)
+            local of = New("Frame", {Position = UDim2.new(0, 0, 0, HH), Size = UDim2.new(1, 0, 0, #opts * RH), BackgroundTransparency = 1, Parent = hd})
+            New("UIListLayout", {Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder, Parent = of})
+            local open = false; local anim = false; local so2
+            local function buildOpt(opt, i)
+                local rb = New("TextButton", {LayoutOrder = i, Size = UDim2.new(1, 0, 0, RH), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = of})
+                local lb = New("TextLabel", {Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(1, -20, 1, 0), BackgroundTransparency = 1, Text = tostring(opt), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.TextDim, TextXAlignment = Enum.TextXAlignment.Left, Parent = rb})
+                rb.MouseEnter:Connect(function() Tw(lb, TF, {TextColor3 = Theme.Text}) end)
+                rb.MouseLeave:Connect(function() Tw(lb, TF, {TextColor3 = Theme.TextDim}) end)
+                rb.MouseButton1Click:Connect(function()
+                    vl = tostring(opt); vt.Text = vl; so2(false)
+                    if op.Callback then task.spawn(op.Callback, vl) end
+                end)
+            end
+            for i, opt in ipairs(opts) do buildOpt(opt, i) end
+            so2 = function(s)
+                if anim or s == open then return end
+                open = s; anim = true
+                Tw(cv, TM, {Rotation = open and 180 or 0})
+                local cnt = 0
+                for _, c in ipairs(of:GetChildren()) do if c:IsA("TextButton") then cnt += 1 end end
+                local tg = HH + (open and (cnt * RH) or 0)
+                local tw = TweenService:Create(hd, open and TM or TF, {Size = UDim2.new(1, 0, 0, tg)})
+                tw.Completed:Once(function() anim = false end); tw:Play()
+            end
+            hr.MouseButton1Click:Connect(function() so2(not open) end)
+            hr.MouseEnter:Connect(function() Tw(vt, TF, {TextColor3 = Theme.Text}) end)
+            hr.MouseLeave:Connect(function() Tw(vt, TF, {TextColor3 = Theme.TextSoft}) end)
+            return {Get = function() return vl end, Set = function(_, v)
+                vl = tostring(v); vt.Text = vl
+                if op.Callback then task.spawn(op.Callback, vl) end
+            end}
+        end
+
+        local function BB(p, o, op)
+            local b = New("TextButton", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = Theme.Control, Text = op.Name, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Theme.TextSoft, AutoButtonColor = false, BorderSizePixel = 0, Parent = p})
+            Cn(b, 3); St(b, Theme.GroupStroke, 0.5)
+            b.MouseEnter:Connect(function() Tw(b, TF, {BackgroundColor3 = Theme.ControlHover}) end)
+            b.MouseLeave:Connect(function() Tw(b, TF, {BackgroundColor3 = Theme.Control}) end)
+            b.MouseButton1Click:Connect(function() if op.Callback then task.spawn(op.Callback) end end)
+            return b
+        end
+
+        local function BL(p, o, op)
+            return New("TextLabel", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = op.Text or "", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = op.Color or Theme.TextDim, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = p})
+        end
+
+        local function BI(p, o, op)
+            local bx = New("Frame", {LayoutOrder = o, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = p})
+            New("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder, Parent = bx})
+            New("TextLabel", {LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = op.Name, Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = Theme.TextSoft, TextXAlignment = Enum.TextXAlignment.Left, Parent = bx})
+            local hd = New("Frame", {LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Theme.Control, BorderSizePixel = 0, Parent = bx})
+            Cn(hd, 3); St(hd, Theme.GroupStroke, 0.5)
+            local tb = New("TextBox", {Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(1, -20, 1, 0), BackgroundTransparency = 1, Text = op.Default or "", PlaceholderText = op.Placeholder or "Type...", PlaceholderColor3 = Theme.TextDim, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.TextSoft, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, Parent = hd})
+            tb.FocusLost:Connect(function() if op.Callback then task.spawn(op.Callback, tb.Text) end end)
+            return {Get = function() return tb.Text end, Set = function(_, v) tb.Text = tostring(v) end}
+        end
+
+        local function CG(cf, t)
+            local g = New("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Theme.Group, BorderSizePixel = 0, Parent = cf})
+            Cn(g, 4); St(g, Theme.GroupStroke, 0.35); Pd(g, 8, 10, 10, 10)
+            New("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = g})
+            New("TextLabel", {LayoutOrder = 0, Size = UDim2.new(1, 0, 0, 12), BackgroundTransparency = 1, Text = string.upper(t), Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = Theme.HeaderText, TextXAlignment = Enum.TextXAlignment.Left, Parent = g})
+            local G = {}; local co = 0
+            local function no() co += 1; return co end
+            function G:AddToggle(o) return BT(g, no(), o) end
+            function G:AddSlider(o) return BSl(g, no(), o) end
+            function G:AddDropdown(o) return BD(g, no(), o) end
+            function G:AddButton(o) return BB(g, no(), o) end
+            function G:AddLabel(o) return BL(g, no(), o) end
+            function G:AddInput(o) return BI(g, no(), o) end
+            return G
+        end
+
+        local function SEL(tab)
+            local prev = ct; ct = tab
+            for _, tb in ipairs(tabs) do
+                local s = (tb == tab)
+                if s then
+                    tb.Page.Visible = true
+                    tb.Page.Position = UDim2.new(0, 0, 0, 0)
+                    tb.Scroller.CanvasPosition = Vector2.new(0, 0)
+                else tb.Page.Visible = false end
+                Tw(tb.Button, TF, {BackgroundTransparency = s and 0 or 1})
+                tb.NameLabel.TextColor3 = s and Theme.Text or Theme.TextDim
+                if tb.IconRef and tb.IconRef:IsA("ImageLabel") then
+                    Tw(tb.IconRef, TF, {ImageColor3 = s and Theme.Accent or Theme.TextDim})
+                end
+            end
+        end
+
+        function Window:AddTab(to)
+            to = to or {}
+            local sn = to.Section or "Main"
+            if not ss[sn] then
+                ss[sn] = true; so += 1
+                New("TextLabel", {LayoutOrder = so, Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = string.upper(sn), Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = Theme.HeaderText, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom, Parent = Sidebar})
+            end
+            so += 1
+            local T = {}
+            local b = New("TextButton", {LayoutOrder = so, Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1, BackgroundColor3 = Theme.TabSelected, Text = "", AutoButtonColor = false, BorderSizePixel = 0, Parent = Sidebar})
+            Cn(b, 3)
+            local ic2 = MI(b, to.Icon, 14, Theme.TextDim)
+            ic2.AnchorPoint = Vector2.new(0, 0.5); ic2.Position = UDim2.new(0, 10, 0.5, 0)
+            local nl = New("TextLabel", {Position = UDim2.new(0, 30, 0, 0), Size = UDim2.new(1, -34, 1, 0), BackgroundTransparency = 1, Text = to.Name or "Tab", Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.TextDim, TextXAlignment = Enum.TextXAlignment.Left, Parent = b})
+            b.MouseEnter:Connect(function() if ct ~= T then Tw(b, TF, {BackgroundTransparency = 0.6}) end end)
+            b.MouseLeave:Connect(function() if ct ~= T then Tw(b, TF, {BackgroundTransparency = 1}) end end)
+            local pg = New("Frame", {Name = "P_" .. (to.Name or "Tab"), Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Visible = false, BorderSizePixel = 0, Parent = Content})
+            local sc = New("ScrollingFrame", {Name = "Scroller", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Accent, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(0, 0, 0, 0), ScrollingDirection = Enum.ScrollingDirection.Y, BorderSizePixel = 0, Parent = pg})
+            local hd = New("Frame", {Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = sc})
+            local lc, rc
+            if isMobile then
+                lc = New("Frame", {Name = "Col", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = hd})
+                New("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = lc})
+                rc = lc
+            else
+                lc = New("Frame", {Name = "Left", Size = UDim2.new(0.5, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = hd})
+                New("UIListLayout", {Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = lc})
+                rc = New("Frame", {Name = "Right", Position = UDim2.new(0.5, 6, 0, 0), Size = UDim2.new(0.5, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Parent = hd})
+                New("UIListLayout", {Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = rc})
+            end
+            T.Page = pg; T.Scroller = sc; T.Button = b; T.NameLabel = nl; T.IconRef = ic2
+            table.insert(tabs, T)
+            b.MouseButton1Click:Connect(function() if ct ~= T then SEL(T) end end)
+            function T:AddGroupbox(go)
+                go = go or {}
+                local c = (go.Column == "Right" and not isMobile) and rc or lc
+                return CG(c, go.Title or "Group")
+            end
+            function T:Select() SEL(T) end
+            if #tabs == 1 then SEL(T) end
+            return T
+        end
+
+        UIS.InputBegan:Connect(function(inp, gp)
+            if gp then return end
+            if inp.KeyCode == tk then setV(not uv) end
+        end)
+        function Window:Toggle() setV(not uv) end
+        function Window:Show() setV(true) end
+        function Window:Hide() setV(false) end
+        function Window:Destroy() Gui:Destroy(); Wm.gui:Destroy(); Ind.gui:Destroy(); Lg.gui:Destroy(); Nt.gui:Destroy() end
+        Window.Main = Main
+        Window.Gui = Gui
+        Window.IsMobile = isMobile
+        setV(true)
+        return Window
+    end
+
+    AngeliUI = Lib
+end
+
+-- ====================== WINDOW + TABS ====================================
+local Window = AngeliUI:CreateWindow({Title = "SERAPHIM", ToggleKey = "LeftControl"})
+local isMobile = Window.IsMobile
+
+local function Notify(t, c, d)
+    pcall(function() Window:Notify({Title = t or "Seraphim", Text = c or "", Duration = d or 2}) end)
+end
+
+local Tabs = {
+    Rage = Window:AddTab({Name = "Autoparry", Icon = "skull", Section = "Combat"}),
+    Detection = Window:AddTab({Name = "Detection", Icon = "eye-off", Section = "Combat"}),
+    Spam = Window:AddTab({Name = "Spam", Icon = "list", Section = "Combat"}),
+    Player = Window:AddTab({Name = "Player", Icon = "user", Section = "Player"}),
+    Visuals = Window:AddTab({Name = "Visuals", Icon = "eye-off", Section = "Visuals"}),
+    Immortal = Window:AddTab({Name = "Immortal", Icon = "skull", Section = "Systems"}),
+    Misc = Window:AddTab({Name = "Misc", Icon = "list", Section = "Misc"}),
+    Settings = Window:AddTab({Name = "Settings", Icon = "save", Section = "Settings"}),
+}
+
+-- ====================== WATERMARK / INDICATOR / LOGGER WIRING ============
+local Wm = Window:Watermark()
+local Ind = Window:Indicator()
+
+local wmPing = Wm:AddBlock("list", "0ms")
+local wmParry = Wm:AddBlock("skull", "P:0")
+local wmStatus = Wm:AddBlock("save", "DISARMED")
+
+wmStatus:Input(function()
+    Window:Toggle()
+end)
+
+Ind:SetRender(true)
+Ind:SetText("READY")
+Ind:SetColor("Blue")
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        safe(function() wmPing:SetText(math.floor(PingCache.get()).."ms") end)
+        safe(function() wmParry:SetText("P:"..tostring(Allusive.parry.hits)) end)
+        safe(function()
+            if Remote.isArmed() then
+                wmStatus:SetText("ARMED")
+                wmStatus:SetColor(Theme.Accent)
+            else
+                wmStatus:SetText("DISARMED")
+            end
+        end)
+        safe(function()
+            if Config.Enabled then
+                Ind:SetText("ACTIVE")
+                Ind:SetColor("Green")
+            else
+                Ind:SetText("IDLE")
+                Ind:SetColor("White")
+            end
+        end)
+    end
+end)
+
+Window:Logger("crosshairs", "Seraphim v5 loaded — NeverLose UI", 10)
+
+-- ====================== UI WIRING — AUTO PARRY ===========================
+local AS = Tabs.Rage:AddGroupbox({Title = "Auto Parry", Column = "Left"})
+AS:AddToggle({Name = "Auto Parry", Default = false, Callback = function(v)
+    if v and not Remote.isArmed() then
+        Notify("Not Armed", "Press your parry key ONCE in-game, then toggle again.", 5)
+        return
+    end
+    Config.Enabled = v
+    if v then AutoParry.start(); Notify("Auto Parry", "ON", 2)
+    else AutoParry.stop(); Notify("Auto Parry", "OFF", 2) end
+end})
+AS:AddDropdown({Name = "Parry Mode", Options = {"Remote", "Keypress"}, Default = "Remote", Callback = function(v)
+    Config.AutoParryMode = v
+end})
+AS:AddDropdown({Name = "Curve Mode", Options = {"camera", "dot", "backwards", "slow", "random", "high", "accelerated"}, Default = "camera", Callback = function(v)
+    Config.CurveMode = v
+end})
+AS:AddButton({Name = "Check Status", Callback = function()
+    if Remote.isArmed() then
+        Notify("Armed", "Remote: "..tostring(Remote.captured.remote.Name).."  key bytes: "..#Remote.key, 5)
+    else Notify("Not Armed", "parry once in-game", 5) end
+end})
+AS:AddButton({Name = "Test Fire", Callback = function()
+    if not Remote.isArmed() then Notify("Fail", "Not armed", 5); return end
+    local ok = BallHelper.parry()
+    Notify("Test Fire", ok and "Sent" or "Failed", 3)
+end})
+AS:AddToggle({Name = "Random Target", Default = false, Callback = function(v)
+    Config.RandomTarget = v
+    Target.current = nil; Target.recently = {}
+    if v then Target.pickRandom() end
+end})
+AS:AddToggle({Name = "Curve Hotkeys (1-6)", Default = false, Callback = function(v)
+    curveHotkeysOn = v
+    Notify("Curve Hotkeys", v and "ON" or "OFF", 2)
+end})
+
+local TB = Tabs.Rage:AddGroupbox({Title = "Triggerbot", Column = "Right"})
+TB:AddToggle({Name = "Enable Triggerbot", Default = false, Callback = function(v)
+    if v and not Remote.isArmed() then
+        Notify("Not Armed", "parry once in-game first", 5); return
+    end
+    Triggerbot.enable(v)
+    Notify("Triggerbot", v and "ON" or "OFF", 2)
+end})
+TB:AddSlider({Name = "Parry Delay", Default = CFG.triggerbotDelay, Min = 0.05, Max = 1.0, Decimals = 2, Callback = function(v)
+    Allusive.triggerbot.delay = v
+end})
+
+-- ====================== UI WIRING — DETECTION ============================
+local FR = Tabs.Detection:AddGroupbox({Title = "Fracture", Column = "Left"})
+FR:AddToggle({Name = "Fracture Detection", Default = false, Callback = function(v)
+    Allusive.detection.fracture = v
+    Notify("Fracture Detection", v and "ON" or "OFF", 2)
+end})
+FR:AddToggle({Name = "Fracture Auto-Ability", Default = true, Callback = function(v)
+    Config.FractureAutoAbility = v
+    Notify("Fracture Auto-Ability", v and "ON" or "OFF", 2)
+end})
+
+local DS1 = Tabs.Detection:AddGroupbox({Title = "Infinity", Column = "Left"})
+DS1:AddToggle({Name = "Infinity Detection", Default = false, Callback = function(v) Allusive.detection.infinity = v end})
+local DS2 = Tabs.Detection:AddGroupbox({Title = "Death Slash", Column = "Left"})
+DS2:AddToggle({Name = "Death Slash Detection", Default = false, Callback = function(v) Allusive.detection.deathslash = v end})
+local DS3 = Tabs.Detection:AddGroupbox({Title = "Time Hole", Column = "Right"})
+DS3:AddToggle({Name = "Time Hole Detection", Default = false, Callback = function(v) Allusive.detection.timehole = v end})
+local DS4 = Tabs.Detection:AddGroupbox({Title = "Slashes Of Fury", Column = "Right"})
+DS4:AddToggle({Name = "Slashes Detection", Default = false, Callback = function(v) Allusive.detection.slashesoffury = v end})
+
+-- ====================== UI WIRING — SPAM =================================
+local SP = Tabs.Spam:AddGroupbox({Title = "Manual Spam", Column = "Left"})
+SP:AddToggle({Name = "Show Spam Button", Default = false, Callback = function(v)
+    Config.ManualSpam = v
+    if v then createSpamButton() else destroySpamButton() end
+end})
+SP:AddToggle({Name = "Enable CPS", Default = true, Callback = function(v) Config.ManualCPSEnabled = v end})
+SP:AddSlider({Name = "CPS", Default = CFG.defaultRemoteCps, Min = 1, Max = CFG.spamHardCapCps, Decimals = 0, Callback = function(v) Config.ManualCPS = v end})
+
+local ASP = Tabs.Spam:AddGroupbox({Title = "Auto Spam", Column = "Right"})
+ASP:AddToggle({Name = "Enable Auto Spam", Default = false, Callback = function(v)
+    if v and not Remote.isArmed() then
+        Notify("Not Armed", "parry once in-game first", 5); return
+    end
+    AutoSpam.enable(v)
+    Notify("Auto Spam", v and "ON" or "OFF", 2)
+end})
+ASP:AddSlider({Name = "Parry Threshold", Default = CFG.defaultParryThreshold, Min = 1, Max = 5, Decimals = 2, Callback = function(v) AutoSpam.threshold = v end})
+
+local Mac = Tabs.Spam:AddGroupbox({Title = "Macros", Column = "Right"})
+Mac:AddToggle({Name = "Turbo Macro", Default = false, Callback = function(v)
+    Macro.enabled = v
+    if v or Macro.macro1 or Macro.macro2 then startMacroLoop() end
+    Notify("Turbo Macro", v and "ON" or "OFF", 2)
+end})
+Mac:AddSlider({Name = "Turbo CPS", Default = CFG.defaultTurboCps, Min = 1, Max = 200, Decimals = 0, Callback = function(v) Macro.cps = v end})
+Mac:AddToggle({Name = "Macro #1", Default = false, Callback = function(v)
+    Macro.macro1 = v
+    if v or Macro.enabled or Macro.macro2 then startMacroLoop() end
+end})
+Mac:AddSlider({Name = "Macro #1 CPS", Default = CFG.defaultMacroCps, Min = 1, Max = 200, Decimals = 0, Callback = function(v) Macro.m1Cps = v end})
+Mac:AddToggle({Name = "Macro #2", Default = false, Callback = function(v)
+    Macro.macro2 = v
+    if v or Macro.enabled or Macro.macro1 then startMacroLoop() end
+end})
+Mac:AddSlider({Name = "Macro #2 CPS", Default = CFG.defaultMacroCps, Min = 1, Max = 200, Decimals = 0, Callback = function(v) Macro.m2Cps = v end})
+
+-- ====================== UI WIRING — PLAYER ===============================
+local PM = Tabs.Player:AddGroupbox({Title = "Player Mods", Column = "Left"})
+PM:AddToggle({Name = "FOV Changer", Default = false, Callback = function(s) PlayerMods.fovEnabled = s; applyPlayerMods() end})
+PM:AddSlider({Name = "FOV", Default = 70, Min = 40, Max = 120, Decimals = 0, Callback = function(v) PlayerMods.fov = v; if PlayerMods.fovEnabled then applyPlayerMods() end end})
+PM:AddToggle({Name = "WalkSpeed", Default = false, Callback = function(s) PlayerMods.wsEnabled = s; if s then startModReapply() end; applyPlayerMods() end})
+PM:AddSlider({Name = "WalkSpeed Value", Default = 16, Min = 8, Max = 200, Decimals = 0, Callback = function(v) PlayerMods.ws = v; if PlayerMods.wsEnabled then applyPlayerMods() end end})
+PM:AddToggle({Name = "JumpPower", Default = false, Callback = function(s) PlayerMods.jpEnabled = s; if s then startModReapply() end; applyPlayerMods() end})
+PM:AddSlider({Name = "JumpPower Value", Default = 50, Min = 20, Max = 300, Decimals = 0, Callback = function(v) PlayerMods.jp = v; if PlayerMods.jpEnabled then applyPlayerMods() end end})
+PM:AddToggle({Name = "Infinite Jump", Default = false, Callback = function(s) PlayerMods.ijEnabled = s; if s then startInfiniteJump() end end})
+
+-- ====================== UI WIRING — VISUALS ==============================
+local VI = Tabs.Visuals:AddGroupbox({Title = "No Render", Column = "Left"})
+VI:AddToggle({Name = "No Render", Default = false, Callback = function(s)
+    noRenderEnable(s); Notify("No Render", s and "ON" or "OFF", 2)
+end})
+
+-- ====================== UI WIRING — IMMORTAL =============================
+local EIBox = Tabs.Immortal:AddGroupbox({Title = "EclipseImmortal (Hook)", Column = "Left"})
+local eiToggle = EIBox:AddToggle({Name = "Enable EclipseImmortal", Default = false, Callback = function(v)
+    Immortal.enableEclipseImmortal(v)
+    if v then Immortal.startEclipseImmortal()
+    else Immortal.stopEclipseImmortal() end
+    Notify("Immortal", v and "EclipseImmortal ON" or "EclipseImmortal OFF")
+end})
+Immortal.ui = Immortal.ui or {}
+Immortal.ui.eclipseToggle = eiToggle
+
+EIBox:AddSlider({Name = "Angle", Default = cfg.angle, Min = 10, Max = 360, Decimals = 0, Callback = function(v) cfg.angle = v; saveImmortalCfg() end})
+EIBox:AddSlider({Name = "Height", Default = cfg.height, Min = 0, Max = 50, Decimals = 0, Callback = function(v) cfg.height = v; saveImmortalCfg() end})
+EIBox:AddSlider({Name = "Depth", Default = cfg.depth, Min = -50, Max = 0, Decimals = 0, Callback = function(v) cfg.depth = v; saveImmortalCfg() end})
+EIBox:AddSlider({Name = "Square Radius", Default = cfg.squareRadius, Min = 0, Max = 100, Decimals = 0, Callback = function(v) cfg.squareRadius = v; saveImmortalCfg() end})
+EIBox:AddToggle({Name = "Speed Bypass", Default = cfg.speedBypass, Callback = function(v) cfg.speedBypass = v; saveImmortalCfg() end})
+
+local SIBox = Tabs.Immortal:AddGroupbox({Title = "Semi Immortal (Desync)", Column = "Right"})
+SIBox:AddToggle({Name = "Enable Semi Immortal", Default = false, Callback = function(v)
+    Immortal.enableDesync(v)
+    if not v and eiToggle then eiToggle:SetValue(false) end
+end})
+SIBox:AddToggle({Name = "RenderStepped Mode", Default = cfg.renderSteppedMode, Callback = function(v)
+    cfg.renderSteppedMode = v; saveImmortalCfg()
+    if Immortal.desyncActive then
+        Immortal.stopDesync(); task.wait(0.05); Immortal.startDesyncLoops()
+    end
+end})
+SIBox:AddSlider({Name = "Beats Per Frame", Default = cfg.beatsPerFrame, Min = 1, Max = 4, Decimals = 0, Callback = function(v) cfg.beatsPerFrame = math.floor(v); saveImmortalCfg() end})
+SIBox:AddToggle({Name = "Phase Jitter", Default = cfg.spoofPhaseJitter, Callback = function(v) cfg.spoofPhaseJitter = v; saveImmortalCfg() end})
+SIBox:AddToggle({Name = "Velocity Scale", Default = cfg.velocityScale, Callback = function(v) cfg.velocityScale = v; saveImmortalCfg() end})
+SIBox:AddToggle({Name = "Physics Pause", Default = cfg.physicsPause, Callback = function(v) cfg.physicsPause = v; saveImmortalCfg() end})
+SIBox:AddToggle({Name = "Micro Jitter", Default = cfg.microJitter, Callback = function(v) cfg.microJitter = v; saveImmortalCfg() end})
+SIBox:AddToggle({Name = "Predictive Velocity", Default = cfg.predictiveVelocity, Callback = function(v) cfg.predictiveVelocity = v; saveImmortalCfg() end})
+SIBox:AddSlider({Name = "Oscillation Radius", Default = cfg.oscRadius, Min = 0, Max = 600, Decimals = 0, Callback = function(v) cfg.oscRadius = v; saveImmortalCfg() end})
+SIBox:AddSlider({Name = "Velocity Spike", Default = cfg.velocitySpike, Min = 0, Max = 50000, Decimals = 0, Callback = function(v) cfg.velocitySpike = v; saveImmortalCfg() end})
+SIBox:AddSlider({Name = "Frame Budget (ms)", Default = Immortal.frameBudgetMs, Min = 1, Max = 16, Decimals = 1, Callback = function(v) Immortal.frameBudgetMs = v; saveImmortalCfg() end})
+
+local SMTBox = Tabs.Immortal:AddGroupbox({Title = "Smart Desync v3", Column = "Right"})
+SMTBox:AddToggle({Name = "Enable Smart Desync", Default = cfg.smart, Callback = function(v)
+    cfg.smart = v
+    if v and not Immortal.desyncActive then Immortal.enableDesync(true) end
+    saveImmortalCfg()
+    Notify("Smart Desync", v and "ON" or "OFF")
+end})
+SMTBox:AddSlider({Name = "Sweep Range", Default = cfg.sweepRange, Min = 20, Max = 5000, Decimals = 0, Callback = function(v) cfg.sweepRange = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Slow Class Cap", Default = cfg.slowCap, Min = 5, Max = 300, Decimals = 0, Callback = function(v) cfg.slowCap = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Fast Class Floor", Default = cfg.fastFloor, Min = 80, Max = 1000, Decimals = 0, Callback = function(v) cfg.fastFloor = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Lead Window", Default = cfg.lead, Min = 0, Max = 60, Decimals = 0, Callback = function(v) cfg.lead = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Hold Slow", Default = cfg.holdSlow, Min = 1, Max = 60, Decimals = 0, Callback = function(v) cfg.holdSlow = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Hold Medium", Default = cfg.holdMed, Min = 1, Max = 60, Decimals = 0, Callback = function(v) cfg.holdMed = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Hold Fast", Default = cfg.holdFast, Min = 1, Max = 60, Decimals = 0, Callback = function(v) cfg.holdFast = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Curve Turn", Default = cfg.turnThreshold, Min = 1, Max = 180, Decimals = 0, Callback = function(v) cfg.turnThreshold = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Curve Boost", Default = cfg.curveBoost, Min = 0, Max = 30, Decimals = 0, Callback = function(v) cfg.curveBoost = v; saveImmortalCfg() end})
+SMTBox:AddSlider({Name = "Miss Boost", Default = cfg.missBoost, Min = 0, Max = 30, Decimals = 0, Callback = function(v) cfg.missBoost = v; saveImmortalCfg() end})
+
+-- ====================== UI WIRING — SETTINGS =============================
+local AB = Tabs.Settings:AddGroupbox({Title = "About", Column = "Left"})
+AB:AddLabel({Text = "Seraphim v5 • NeverLose UI Edition\nAccuracy: 65 (locked)\nImmortal v4.1 (high-freq)\nAll real + training balls"})
+AB:AddButton({Name = "Rejoin Game", Callback = function()
+    safe(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+end})
+AB:AddButton({Name = "Unload Seraphim", Callback = function()
+    if getgenv().SeraphimUnload then safe(getgenv().SeraphimUnload) end
+end})
+
+local FF = Tabs.Settings:AddGroupbox({Title = "FFlag Tools", Column = "Right"})
+local fflagFile = "Seraphim/fflags.json"
+safe(function()
+    if makefolder and not isfolder("Seraphim") then makefolder("Seraphim") end
+end)
+local function loadFFlags()
+    local map = {}
+    safe(function()
+        if isfile and isfile(fflagFile) then
+            local d = HttpService:JSONDecode(readfile(fflagFile))
+            if type(d) == "table" then map = d end
+        end
+    end)
+    return map
+end
+local function applyFFlag(name, value)
+    name = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return false, "empty name" end
+    local ok, err = pcall(function()
+        if setfflag then setfflag(name, tostring(value))
+        elseif setfflags then setfflags(name, tostring(value))
+        else error("no setfflag available") end
+    end)
+    if ok then
+        local m = loadFFlags(); m[name] = tostring(value)
+        safe(function() writefile(fflagFile, HttpService:JSONEncode(m)) end)
+    end
+    return ok, err
+end
+FF:AddInput({Name = "Set FFlag", Default = "", Placeholder = "Name=Value", Callback = function(value)
+    if type(value) ~= "string" or value == "" then return end
+    local name, val = value:match("^([^=]+)=(.+)$")
+    if not name then Notify("FFlag", "Format: Name=Value", 3); return end
+    local ok, err = applyFFlag(name, val)
+    if ok then Notify("FFlag Saved", tostring(name).." = "..tostring(val), 5)
+    else Notify("FFlag Failed", tostring(err), 5) end
+end})
+
+-- ====================== FINAL ===========================================
+Notify("Seraphim", "Loaded — NeverLose UI", 4)
+log("loaded — all chunks OK")
+
+end) -- end pcall wrapper
+
+if not _ok then
+    warn("[Seraphim] CRITICAL ERROR: " .. tostring(_err))
+end
